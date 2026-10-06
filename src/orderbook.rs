@@ -33,57 +33,57 @@ pub enum OrderStatus {
 }
 
 pub struct Balance {
-    locked: u64,
-    available: u64,
+    pub locked: u64,
+    pub available: u64,
 }
 
 pub struct Order {
-    request_id: u32,
-    order_id: String,
-    user_id: String,
-    order_type: OrderType,
-    side: Side,
-    symbol: String,
-    quantity: u64,
-    price: u64,
+    pub request_id: u32,
+    pub order_id: String,
+    pub user_id: String,
+    pub order_type: OrderType,
+    pub side: Side,
+    pub symbol: String,
+    pub quantity: u64,
+    pub price: u64,
 
-    fills: Vec<Fill>,
-    created_at: u32,
+    pub fills: Vec<Fill>,
+    pub created_at: u32,
 }
 
 #[derive(Debug)]
 pub struct OpenOrder {
-    request_id: String,
-    user_id: String,
-    order_id: String,
-    order_type: OrderType,
-    side: Side,
-    symbol: String,
-    quantity: u64,
-    price: u64,
-    created_at: u32,
+    pub request_id: String,
+    pub user_id: String,
+    pub order_id: String,
+    pub order_type: OrderType,
+    pub side: Side,
+    pub symbol: String,
+    pub quantity: u64,
+    pub price: u64,
+    pub created_at: u32,
 }
 
 pub struct Fill {
-    buy_user_id: String,
-    buy_order_id: String,
-    sell_user_id: String,
-    sell_order_id: String,
+    pub buy_user_id: String,
+    pub buy_order_id: String,
+    pub sell_user_id: String,
+    pub sell_order_id: String,
 
-    filled_quantity: u64,
+    pub filled_quantity: u64,
 
-    order_type: OrderType,
-    side: Side,
-    symbol: String,
-    quantity: u64,
-    price: u64,
-    created_at: u32,
+    pub order_type: OrderType,
+    pub side: Side,
+    pub symbol: String,
+    pub quantity: u64,
+    pub price: u64,
+    pub created_at: u32,
 }
 
 #[derive(Debug)]
 pub struct Orderbook {
-    asks: BTreeMap<u64, VecDeque<OpenOrder>>,
-    bids: BTreeMap<u64, VecDeque<OpenOrder>>,
+    pub asks: BTreeMap<u64, VecDeque<OpenOrder>>,
+    pub bids: BTreeMap<u64, VecDeque<OpenOrder>>,
 }
 
 pub fn orderbook_mock() {
