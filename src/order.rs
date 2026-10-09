@@ -51,6 +51,7 @@ pub trait Orderbook {
     fn get_order(&self, order_id: String);
     fn get_depth(&self);
     fn limit_order_matching(&mut self, order: OpenOrder);
+    fn market_order_matching(&mut self, order: OpenOrder);
 }
 
 impl Orderbook for ORDERBOOK {
@@ -83,14 +84,14 @@ impl Orderbook for ORDERBOOK {
 
                 // let (lowest_price, lowest_orders) = self.asks.first_key_value().unwrap();
 
-                self.order_matching(order);
+                self.limit_order_matching(order);
 
                 //no order available at this price, create new vec with this order
             } else {
                 //TODO: if bids in orderbook is empty throw error
                 println!("sell order");
 
-                self.order_matching(order);
+                self.limit_order_matching(order);
             }
         }
     }
@@ -153,7 +154,7 @@ impl Orderbook for ORDERBOOK {
 
                 let ord_price = order.price;
 
-                let new_order = OpenOrder {
+                let new_open_order = OpenOrder {
                     request_id: order.request_id.clone(),
                     user_id: order.user_id.clone(),
                     order_id: order.order_id.clone(),
@@ -166,13 +167,13 @@ impl Orderbook for ORDERBOOK {
                 };
 
                 // self.bids.insert(ord_price, order_arr);
-                println!("new_order: {:?}", &new_order);
+                println!("new_open_order: {:?}", &new_open_order);
 
                 if order.side == Buy {
                     self.bids
                         .entry(ord_price)
                         .or_default()
-                        .push_front(new_order);
+                        .push_front(new_open_order);
 
                     println!("filled_quantity: {}", filled_quantity);
 
@@ -182,7 +183,7 @@ impl Orderbook for ORDERBOOK {
                     self.asks
                         .entry(ord_price)
                         .or_default()
-                        .push_front(new_order);
+                        .push_front(new_open_order);
 
                     println!("filled_quantity: {}", filled_quantity);
 
@@ -337,6 +338,210 @@ impl Orderbook for ORDERBOOK {
 
                 if bid_ords.len() == 0 {
                     self.bids.remove(&book_order_price);
+                }
+            }
+        }
+    }
+
+    fn market_order_matching(&mut self, order: OpenOrder) {
+        println!("order matching called");
+
+        let mut new_order = Order::new(
+            order.request_id.clone(),
+            order.user_id.clone(),
+            order.order_id.clone(),
+            order.order_type.clone(),
+            order.side.clone(),
+            order.symbol.clone(),
+            order.quantity,
+            order.price,
+            Utc::now().timestamp_millis() as u32,
+            vec![],
+        );
+
+        let mut filled_quantity = 0;
+
+        loop {
+            let ord_key_val = if order.side == Buy {
+                self.asks.first_key_value().unwrap().to_owned()
+            } else {
+                self.bids.last_key_value().unwrap().to_owned()
+            };
+
+            let book_order_price = ord_key_val.0.to_owned();
+
+            let book_orders = ord_key_val.1.clone();
+
+            println!(
+                "book_orders: {:?}, book_order_price: {}",
+                book_orders, book_order_price
+            );
+
+            let mut book_quan = 0;
+
+            for (p, o) in &self.asks {
+                let mut vec_quan = 0;
+
+                for i in o {
+                    vec_quan += i.quantity;
+                }
+                println!("vec_quan: {}", vec_quan);
+                book_quan += vec_quan;
+            }
+
+            println!("book_quan : {}", book_quan);
+
+            if book_quan < order.quantity {
+                //return not enough orders on the book
+                return;
+            } else {
+                for o in book_orders.iter() {
+                    println!("looping over order: {:?}", o);
+
+                    //equal to order then remove from book, if remainning less then just
+                    //decrease from book
+                    if o.quantity >= (order.quantity - filled_quantity) {
+                        //order will be filled by this order only but this also could apply for
+                        //second iteration
+
+                        //TODO: generate fill id
+                        let fill = Fill::new(
+                            "fill_123".to_string(),
+                            order.user_id.clone(),
+                            order.order_id.clone(),
+                            o.user_id.clone(),
+                            o.order_id.clone(),
+                            o.quantity,
+                            order.order_type.clone(),
+                            Buy.clone(),
+                            order.symbol.clone(),
+                            order.quantity,
+                            book_order_price,
+                            Utc::now().timestamp_millis() as u32,
+                        );
+
+                        new_order.fills.push(fill);
+
+                        //TODO: increase the fill , decrease matched quantity
+                        filled_quantity += order.quantity - filled_quantity;
+
+                        //TODO:  push fill to fill array
+                        // returing, remove from book
+
+                        if order.side == Buy {
+                            let ask_orders = self.asks.get_mut(&book_order_price).unwrap();
+
+                            println!("ask_orders: {:?}:", ask_orders);
+
+                            let index = ask_orders
+                                .iter()
+                                .position(|ord| ord.clone() == o.clone())
+                                .unwrap();
+
+                            println!("matched order index: {}", index);
+
+                            if o.quantity > (order.quantity - filled_quantity) {
+                                //decrease current order quantity
+                                let current_ord = ask_orders.get_mut(index).unwrap();
+                                current_ord.quantity -= (order.quantity - filled_quantity);
+                            } else {
+                                ask_orders.remove(index);
+                            }
+
+                            //TODO: order fully filled return with fill and filled_quantity
+                            println!("order fully filled return");
+                            return;
+                        } else {
+                            let bid_orders = self.bids.get_mut(&book_order_price).unwrap();
+
+                            println!("bid_orders: {:?}:", bid_orders);
+
+                            let index = bid_orders
+                                .iter()
+                                .position(|ord| ord.clone() == o.clone())
+                                .unwrap();
+
+                            println!("matched order index: {}", index);
+
+                            if o.quantity > (order.quantity - filled_quantity) {
+                                //decrease current order quantity
+                                let current_ord = bid_orders.get_mut(index).unwrap();
+                                current_ord.quantity -= (order.quantity - filled_quantity);
+                            } else {
+                                bid_orders.remove(index);
+                            }
+
+                            //TODO: order fully filled return with fill and filled_quantity
+                            println!("order fully filled return");
+                            return;
+                        }
+                    } else {
+                        //order will not filled by this only, just increase the fill and push to
+                        //fills array , remote current order from book
+                        let fill = Fill::new(
+                            "fill_456".to_string(),
+                            order.user_id.clone(),
+                            order.order_id.clone(),
+                            o.user_id.clone(),
+                            o.order_id.clone(),
+                            o.quantity,
+                            order.order_type.clone(),
+                            Buy.clone(),
+                            order.symbol.clone(),
+                            order.quantity,
+                            book_order_price,
+                            Utc::now().timestamp_millis() as u32,
+                        );
+
+                        new_order.fills.push(fill);
+
+                        filled_quantity += o.quantity;
+
+                        //TODO:  push fill to fill array
+                        //remove from book
+
+                        if order.side == Buy {
+                            let ask_orders = self.asks.get_mut(&book_order_price).unwrap();
+
+                            println!("ask_orders: {:?}:", ask_orders);
+
+                            let index = ask_orders
+                                .iter()
+                                .position(|ord| ord.clone() == o.clone())
+                                .unwrap();
+
+                            println!("matched order index: {}", index);
+
+                            ask_orders.remove(index);
+                        } else {
+                            let bid_orders = self.bids.get_mut(&book_order_price).unwrap();
+
+                            println!("bid_orders: {:?}:", bid_orders);
+
+                            let index = bid_orders
+                                .iter()
+                                .position(|ord| ord.clone() == o.clone())
+                                .unwrap();
+
+                            println!("matched order index: {}", index);
+
+                            bid_orders.remove(index);
+                        }
+                    }
+                }
+
+                if order.side == Buy {
+                    let ask_ords = self.asks.get(&book_order_price).unwrap();
+
+                    if ask_ords.len() == 0 {
+                        self.asks.remove(&book_order_price);
+                    }
+                } else {
+                    let bid_ords = self.bids.get(&book_order_price).unwrap();
+
+                    if bid_ords.len() == 0 {
+                        self.bids.remove(&book_order_price);
+                    }
                 }
             }
         }
