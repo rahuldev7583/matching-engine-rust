@@ -1,4 +1,4 @@
-use crate::orderbook::*;
+use crate::{order::Orderbook, orderbook::*};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 mod order;
@@ -12,11 +12,7 @@ fn main() {
 
     //orderbook_mock();
 
-    let mut orderbook = Orderbook {
-        asks: BTreeMap::new(),
-        bids: BTreeMap::new(),
-    };
-
+    let mut orderbook = ORDERBOOK::new();
     let mut balances: HashMap<String, Balance> = HashMap::new();
     // let mut orders: HashMap<String, OpenOrder> = HashMap::new();
 

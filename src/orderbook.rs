@@ -6,7 +6,7 @@ use strum::{Display, EnumString};
 
 use crate::orderbook::{OrderType::Limit, Side::Buy};
 
-#[derive(Debug, Display, EnumString)]
+#[derive(Debug, Display, EnumString, PartialEq, Eq, Clone)]
 pub enum Side {
     #[strum(serialize = "buy")]
     Buy,
@@ -14,7 +14,7 @@ pub enum Side {
     Sell,
 }
 
-#[derive(Debug, Display, EnumString)]
+#[derive(Debug, Display, EnumString, PartialEq, Eq, Clone)]
 pub enum OrderType {
     #[strum(serialize = "limit")]
     Limit,
@@ -36,9 +36,9 @@ pub struct Balance {
     pub locked: u64,
     pub available: u64,
 }
-
+#[derive(Debug, Clone)]
 pub struct Order {
-    pub request_id: u32,
+    pub request_id: String,
     pub order_id: String,
     pub user_id: String,
     pub order_type: OrderType,
@@ -51,7 +51,35 @@ pub struct Order {
     pub created_at: u32,
 }
 
-#[derive(Debug)]
+impl Order {
+    pub fn new(
+        request_id: String,
+        user_id: String,
+        order_id: String,
+        order_type: OrderType,
+        side: Side,
+        symbol: String,
+        quantity: u64,
+        price: u64,
+        created_at: u32,
+        fills: Vec<Fill>,
+    ) -> Self {
+        Self {
+            request_id,
+            order_id,
+            user_id,
+            order_type,
+            side,
+            symbol,
+            quantity,
+            price,
+            fills,
+            created_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct OpenOrder {
     pub request_id: String,
     pub user_id: String,
@@ -64,7 +92,9 @@ pub struct OpenOrder {
     pub created_at: u32,
 }
 
+#[derive(Debug, Clone)]
 pub struct Fill {
+    pub fill_id: String,
     pub buy_user_id: String,
     pub buy_order_id: String,
     pub sell_user_id: String,
@@ -80,14 +110,46 @@ pub struct Fill {
     pub created_at: u32,
 }
 
+impl Fill {
+    pub fn new(
+        fill_id: String,
+        buy_user_id: String,
+        buy_order_id: String,
+        sell_user_id: String,
+        sell_order_id: String,
+        filled_quantity: u64,
+        order_type: OrderType,
+        side: Side,
+        symbol: String,
+        quantity: u64,
+        price: u64,
+        created_at: u32,
+    ) -> Self {
+        Self {
+            fill_id,
+            buy_user_id,
+            buy_order_id,
+            sell_user_id,
+            sell_order_id,
+            filled_quantity,
+            order_type,
+            side,
+            symbol,
+            quantity,
+            price,
+            created_at,
+        }
+    }
+}
+
 #[derive(Debug)]
-pub struct Orderbook {
+pub struct ORDERBOOK {
     pub asks: BTreeMap<u64, VecDeque<OpenOrder>>,
     pub bids: BTreeMap<u64, VecDeque<OpenOrder>>,
 }
 
 pub fn orderbook_mock() {
-    let mut orderbook = Orderbook {
+    let mut orderbook = ORDERBOOK {
         asks: BTreeMap::new(),
         bids: BTreeMap::new(),
     };
