@@ -1,6 +1,6 @@
 //Order , OpenOrder, Fill, Market, Side, order_type, orderbook
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use strum::{Display, EnumString};
 
@@ -146,12 +146,25 @@ impl Fill {
 pub struct ORDERBOOK {
     pub asks: BTreeMap<u64, VecDeque<OpenOrder>>,
     pub bids: BTreeMap<u64, VecDeque<OpenOrder>>,
+    pub orders: HashMap<String, OpenOrder>,
+}
+
+impl ORDERBOOK {
+    pub fn new() -> Self {
+        Self {
+            asks: BTreeMap::new(),
+            bids: BTreeMap::new(),
+            orders: HashMap::new(),
+        }
+    }
 }
 
 pub fn orderbook_mock() {
     let mut orderbook = ORDERBOOK {
         asks: BTreeMap::new(),
         bids: BTreeMap::new(),
+
+        orders: HashMap::new(),
     };
 
     println!("orderbook: {:?}", orderbook);

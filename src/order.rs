@@ -33,7 +33,7 @@
 //              do the opposite
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     iter,
 };
 
@@ -47,11 +47,23 @@ use crate::orderbook::{
 pub trait Orderbook {
     fn new() -> Self;
     fn create_order(&mut self, order: OpenOrder);
-    fn cancel_order(&self, order_id: String);
+    fn cancel_order(&mut self, order_id: String);
     fn get_order(&self, order_id: String);
-    fn get_depth(&self);
+    fn get_depth(&self, limit: u64);
     fn limit_order_matching(&mut self, order: OpenOrder);
     fn market_order_matching(&mut self, order: OpenOrder);
+}
+
+#[derive(Debug)]
+pub struct Depth {
+    price: u64,
+    quantity: u64,
+}
+
+impl Depth {
+    pub fn new(price: u64, quantity: u64) -> Self {
+        Self { price, quantity }
+    }
 }
 
 impl Orderbook for ORDERBOOK {
@@ -59,6 +71,7 @@ impl Orderbook for ORDERBOOK {
         Self {
             asks: BTreeMap::new(),
             bids: BTreeMap::new(),
+            orders: HashMap::new(),
         }
     }
     fn create_order(&mut self, order: OpenOrder) {
@@ -72,9 +85,23 @@ impl Orderbook for ORDERBOOK {
                 //TODO: if asks in orderbook is empty throw error
 
                 println!("buy order");
+
+                if self.asks.is_empty() {
+                    //return here as orderbook is empty, market order cannot processed
+                    return;
+                } else {
+                    self.market_order_matching(order);
+                }
             } else {
                 //TODO: if bids in orderbook is empty throw error
                 println!("sell order");
+
+                if self.bids.is_empty() {
+                    //return here as orderbook is empty, market order cannot processed
+                    return;
+                } else {
+                    self.market_order_matching(order);
+                }
             }
         } else {
             println!("limit order");
@@ -96,16 +123,82 @@ impl Orderbook for ORDERBOOK {
         }
     }
 
-    fn cancel_order(&self, order_id: String) {
-        todo!()
+    fn cancel_order(&mut self, order_id: String) {
+        let order = self.orders.get(&order_id).unwrap().clone();
+        println!("open order: {:?}", order);
+
+        self.orders.remove(&order_id);
+
+        let price = order.price;
+
+        if order.side == Buy {
+            let mut bid_orders = self.bids.get_mut(&price).unwrap();
+
+            let index = bid_orders
+                .iter()
+                .position(|ord| ord.clone() == order.clone())
+                .unwrap();
+
+            println!("matched order index: {}", index);
+
+            bid_orders.remove(index);
+        } else {
+            let mut ask_orders = self.asks.get_mut(&price).unwrap();
+
+            let index = ask_orders
+                .iter()
+                .position(|ord| ord.clone() == order.clone())
+                .unwrap();
+
+            println!("matched order index: {}", index);
+
+            ask_orders.remove(index);
+        }
     }
 
     fn get_order(&self, order_id: String) {
-        todo!()
+        let order = self.orders.get(&order_id).unwrap();
+        println!("open order: {:?}", order);
     }
 
-    fn get_depth(&self) {
-        todo!()
+    fn get_depth(&self, limit: u64) {
+        //TODO: loop over asks and bids, calculated total quantity, return asks: [ [price, total quantity] ], bids ....;
+
+        let mut agg_asks: Vec<Depth> = Vec::new();
+        let mut agg_bids = vec![];
+
+        for (p, o) in &self.asks {
+            let mut price: u64 = p.to_owned();
+            let mut quantity: u64 = 0;
+
+            for ord in o {
+                quantity += ord.quantity;
+            }
+
+            println!("price: {}, quantity: {}", price, quantity);
+
+            let current_dep = Depth::new(price, quantity);
+
+            agg_asks.push(current_dep);
+        }
+
+        println!("agg_asks: {:?}", agg_asks);
+
+        for (p, o) in &self.bids {
+            let mut price = p.to_owned();
+            let mut quantity: u64 = 0;
+
+            for ord in o {
+                quantity += ord.quantity;
+            }
+
+            println!("price: {}, quantity: {}", price, quantity);
+            let current_dep = Depth::new(price, quantity);
+
+            agg_bids.push(current_dep);
+        }
+
+        println!("agg_bids: {:?}", agg_bids);
     }
 
     fn limit_order_matching(&mut self, order: OpenOrder) {
@@ -330,13 +423,13 @@ impl Orderbook for ORDERBOOK {
             if order.side == Buy {
                 let ask_ords = self.asks.get(&book_order_price).unwrap();
 
-                if ask_ords.len() == 0 {
+                if ask_ords.is_empty() {
                     self.asks.remove(&book_order_price);
                 }
             } else {
                 let bid_ords = self.bids.get(&book_order_price).unwrap();
 
-                if bid_ords.len() == 0 {
+                if bid_ords.is_empty() {
                     self.bids.remove(&book_order_price);
                 }
             }
