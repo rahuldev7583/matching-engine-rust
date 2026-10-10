@@ -89,7 +89,7 @@ pub struct OpenOrder {
     pub symbol: String,
     pub quantity: u64,
     pub price: u64,
-    pub created_at: u32,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone)]
