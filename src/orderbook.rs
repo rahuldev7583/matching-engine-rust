@@ -22,14 +22,20 @@ pub enum OrderType {
     Market,
 }
 
-#[derive(Debug, Display, EnumString)]
+#[derive(Debug, EnumString, PartialEq)]
 pub enum OrderStatus {
-    #[strum(serialize = "filled")]
-    Filled,
-    #[strum(serialize = "partially-filled")]
+    #[strum(serialize = "accepted")]
+    Accepted,
+    #[strum(serialize = "rejected")]
+    Rejected,
+    #[strum(serialize = "fully filled")]
+    FullyFilled,
+    #[strum(serialize = "partially filled")]
     PartiallyFilled,
     #[strum(serialize = "cancelled")]
     Cancelled,
+    #[strum(serialize = "self-trade-prevented")]
+    SelfTradePrevented,
 }
 
 pub struct Balance {
