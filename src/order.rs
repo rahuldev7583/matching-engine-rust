@@ -34,25 +34,45 @@
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    iter,
+    io::{self, Write},
+    iter::{self, Skip},
 };
 
 use anyhow::{Error, Ok, Result};
 use chrono::Utc;
+use strum::EnumString;
 
 use crate::orderbook::{
     Fill, ORDERBOOK, OpenOrder, Order, OrderType,
-    Side::{self, Buy},
+    Fill, ORDERBOOK, OpenOrder, Order,
+    OrderStatus::{self, Accepted, Cancelled, FullyFilled, PartiallyFilled, SelfTradePrevented},
+    OrderType,
+    Side::{self, Buy, Sell},
 };
+
+#[derive(Debug)]
+pub struct OrderDetail {
+    order_id: String,
+    filled_quantity: u64,
+    status: OrderStatus,
+}
+
+#[derive(Debug)]
+pub struct DepthDetail {
+    asks: Vec<Depth>,
+    bids: Vec<Depth>,
+    timestamp: i64,
+}
 
 pub trait Orderbook {
     fn new() -> Self;
-    fn create_order(&mut self, order: OpenOrder) -> Result<String, Error>;
+    fn create_order(&mut self, order: OpenOrder) -> Result<OrderDetail, Error>;
     fn cancel_order(&mut self, order_id: String) -> Result<String, Error>;
     fn get_order(&self, order_id: String) -> Result<OpenOrder, Error>;
-    fn get_depth(&self, limit: u64);
-    fn limit_order_matching(&mut self, order: OpenOrder) -> Result<String, Error>;
-    fn market_order_matching(&mut self, order: OpenOrder) -> Result<String, Error>;
+    fn get_depth(&self, limit: u64) -> DepthDetail;
+    fn limit_order_matching(&mut self, order: OpenOrder) -> Result<OrderDetail, Error>;
+    fn market_order_matching(&mut self, order: OpenOrder) -> Result<OrderDetail, Error>;
+    fn order_clean(&mut self, side: &Side, book_price: u64, matated_order_id: &String) -> bool;
 }
 
 #[derive(Debug)]
@@ -75,7 +95,7 @@ impl Orderbook for ORDERBOOK {
             orders: HashMap::new(),
         }
     }
-    fn create_order(&mut self, order: OpenOrder) -> Result<String, Error> {
+    fn create_order(&mut self, order: OpenOrder) -> Result<OrderDetail, Error> {
         println!("create_order");
         println!("order: {:?}", order);
 
@@ -185,13 +205,13 @@ impl Orderbook for ORDERBOOK {
         }
     }
 
-    fn get_depth(&self, limit: u64) {
+    fn get_depth(&self, limit: u64) -> DepthDetail {
         //TODO: loop over asks and bids, calculated total quantity, return asks: [ [price, total quantity] ], bids ....;
 
         let mut agg_asks: Vec<Depth> = Vec::new();
         let mut agg_bids = vec![];
 
-        for (p, o) in &self.asks {
+        for (p, o) in self.asks.iter().take(limit as usize) {
             let mut price: u64 = p.to_owned();
             let mut quantity: u64 = 0;
 
@@ -208,7 +228,7 @@ impl Orderbook for ORDERBOOK {
 
         println!("agg_asks: {:?}", agg_asks);
 
-        for (p, o) in &self.bids {
+        for (p, o) in self.bids.iter().take(limit as usize) {
             let mut price = p.to_owned();
             let mut quantity: u64 = 0;
 
@@ -223,10 +243,16 @@ impl Orderbook for ORDERBOOK {
         }
 
         println!("agg_bids: {:?}", agg_bids);
+
+        DepthDetail {
+            asks: agg_asks,
+            bids: agg_bids,
+            timestamp: Utc::now().timestamp_millis(),
+        }
     }
 
-    fn limit_order_matching(&mut self, order: OpenOrder) -> Result<String, Error> {
-        println!("order matching called");
+    fn limit_order_matching(&mut self, order: OpenOrder) -> Result<OrderDetail, Error> {
+        println!("limit order matching called");
 
         let mut new_order = Order::new(
             order.request_id.clone(),
@@ -243,7 +269,9 @@ impl Orderbook for ORDERBOOK {
 
         let mut filled_quantity = 0;
 
-        if self.asks.is_empty() {
+        println!("asks: {:?}", &self.asks);
+
+        if order.side == Buy && self.asks.is_empty() {
             let ord_price = order.price;
 
             let new_open_order = OpenOrder {
@@ -261,7 +289,12 @@ impl Orderbook for ORDERBOOK {
             // self.bids.insert(ord_price, order_arr);
             println!("new_open_order: {:?}", &new_open_order);
 
-            if order.side.clone() == Buy {
+            let existing_ord = self.orders.get(&order.order_id).is_some();
+            println!("existing_order: {}", existing_ord);
+
+            if existing_ord {
+                Err(Error::msg("Order already exit with this order id"))
+            } else {
                 self.bids
                     .entry(ord_price)
                     .or_default()
@@ -272,7 +305,30 @@ impl Orderbook for ORDERBOOK {
                 self.orders.insert(order.order_id.clone(), order.clone());
 
                 //TODO: Return with fills and filled quantity, book has no longer match order for this price, push remainning quantity to the book
-                Ok(order.order_id)
+                Ok(OrderDetail {
+                    order_id: order.order_id,
+                    filled_quantity,
+                    status: Accepted,
+                })
+            }
+        } else if order.side == Sell && self.bids.is_empty() {
+            let ord_price = order.price;
+
+            let new_open_order = OpenOrder {
+                request_id: order.request_id.clone(),
+                user_id: order.user_id.clone(),
+                order_id: order.order_id.clone(),
+                order_type: order.order_type.clone(),
+                side: order.side.clone(),
+                symbol: order.symbol.clone(),
+                quantity: order.quantity - filled_quantity,
+                price: order.price,
+                created_at: order.created_at,
+            };
+            let existing_ord = self.orders.get(&order.order_id).is_some();
+
+            if existing_ord {
+                Err(Error::msg("Order already exit with this order id"))
             } else {
                 self.asks
                     .entry(ord_price)
@@ -284,83 +340,487 @@ impl Orderbook for ORDERBOOK {
                 self.orders.insert(order.order_id.clone(), order.clone());
 
                 //TODO: Return with fills and filled quantity, book has no longer match order for this price, push remainning quantity to the book
-                Ok(order.order_id)
+                Ok(OrderDetail {
+                    order_id: order.order_id,
+                    filled_quantity,
+                    status: Accepted,
+                })
             }
         } else {
             loop {
                 let ord_key_val = if order.side == Buy {
-                    self.asks.first_key_value().unwrap().to_owned()
+                    self.asks.first_key_value()
                 } else {
-                    self.bids.last_key_value().unwrap().to_owned()
+                    self.bids.last_key_value()
                 };
 
-                let book_order_price = ord_key_val.0.to_owned();
+                match ord_key_val {
+                    Some(order_key_value) => {
+                        println!("400");
+                        let book_order_price = order_key_value.0.to_owned();
 
-                let book_orders = ord_key_val.1.clone();
+                        let book_orders = order_key_value.1.clone();
 
-                println!(
-                    "book_orders: {:?}, book_order_price: {}",
-                    book_orders, book_order_price
-                );
+                        println!(
+                            "book_orders: {:?}, book_order_price: {}",
+                            book_orders, book_order_price
+                        );
 
-                let order_cond = if order.side == Buy {
-                    order.price < book_order_price
-                } else {
-                    order.price > book_order_price
-                };
-                //order got matched, order will be fully or Partially filled
-                if order_cond {
-                    //book doesn't have correct price for this order, return will fill quantity, push to
-                    //book with remainning quantity
+                        let order_cond = if order.side == Buy {
+                            order.price < book_order_price
+                        } else {
+                            order.price > book_order_price
+                        };
+                        //order got matched, order will be fully or Partially filled
+                        if order_cond {
+                            //book doesn't have correct price for this order, return will fill quantity, push to
+                            //book with remainning quantity
 
-                    let ord_price = order.price;
+                            let ord_price = order.price;
 
-                    let new_open_order = OpenOrder {
-                        request_id: order.request_id.clone(),
-                        user_id: order.user_id.clone(),
-                        order_id: order.order_id.clone(),
-                        order_type: order.order_type.clone(),
-                        side: order.side.clone(),
-                        symbol: order.symbol.clone(),
-                        quantity: order.quantity - filled_quantity,
-                        price: order.price,
-                        created_at: order.created_at,
-                    };
+                            let new_open_order = OpenOrder {
+                                request_id: order.request_id.clone(),
+                                user_id: order.user_id.clone(),
+                                order_id: order.order_id.clone(),
+                                order_type: order.order_type.clone(),
+                                side: order.side.clone(),
+                                symbol: order.symbol.clone(),
+                                quantity: order.quantity - filled_quantity,
+                                price: order.price,
+                                created_at: order.created_at,
+                            };
 
-                    // self.bids.insert(ord_price, order_arr);
-                    println!("new_open_order: {:?}", &new_open_order);
+                            // self.bids.insert(ord_price, order_arr);
+                            println!("new_open_order: {:?}", &new_open_order);
 
-                    if order.side == Buy {
-                        self.bids
-                            .entry(ord_price)
-                            .or_default()
-                            .push_front(new_open_order);
+                            let existing_ord = self.orders.get(&order.order_id).is_some();
+                            println!("existing_order: {}", existing_ord);
 
-                        println!("filled_quantity: {}", filled_quantity);
-                        self.orders.insert(order.order_id.clone(), order.clone());
-                        //TODO: Return with fills and filled quantity, book has no longer match order for this price, push remainning quantity to the book
-                        return Ok(order.order_id);
-                    } else {
-                        self.asks
-                            .entry(ord_price)
-                            .or_default()
-                            .push_front(new_open_order);
+                            if existing_ord {
+                                return Err(Error::msg("Order already exit with this order id"));
+                            } else {
+                                if order.side == Buy {
+                                    self.bids
+                                        .entry(ord_price)
+                                        .or_default()
+                                        .push_front(new_open_order);
 
-                        println!("filled_quantity: {}", filled_quantity);
-                        self.orders.insert(order.order_id.clone(), order.clone());
-                        //TODO: Return with fills and filled quantity, book has no longer match order for this price, push remainning quantity to the book
-                        return Ok(order.order_id);
+                                    println!("filled_quantity: {}", filled_quantity);
+                                    self.orders.insert(order.order_id.clone(), order.clone());
+                                    //TODO: Return with fills and filled quantity, book has no longer match order for this price, push remainning quantity to the book
+                                    return Ok(OrderDetail {
+                                        order_id: order.order_id,
+                                        filled_quantity,
+                                        status: if filled_quantity == order.quantity {
+                                            FullyFilled
+                                        } else if filled_quantity > 0 {
+                                            PartiallyFilled
+                                        } else {
+                                            Accepted
+                                        },
+                                    });
+                                } else {
+                                    self.asks
+                                        .entry(ord_price)
+                                        .or_default()
+                                        .push_front(new_open_order);
+
+                                    println!("filled_quantity: {}", filled_quantity);
+                                    self.orders.insert(order.order_id.clone(), order.clone());
+                                    //TODO: Return with fills and filled quantity, book has no longer match order for this price, push remainning quantity to the book
+                                    return Ok(OrderDetail {
+                                        order_id: order.order_id,
+                                        filled_quantity,
+                                        status: if filled_quantity == order.quantity {
+                                            FullyFilled
+                                        } else if filled_quantity > 0 {
+                                            PartiallyFilled
+                                        } else {
+                                            Accepted
+                                        },
+                                    });
+                                }
+                            }
+                        } else {
+                            for o in book_orders.iter().rev() {
+                                if o.user_id == order.user_id {
+                                    return Ok(OrderDetail {
+                                        order_id: order.order_id,
+                                        filled_quantity,
+                                        status: SelfTradePrevented,
+                                    });
+                                } else {
+                                    if o.quantity >= (order.quantity - filled_quantity) {
+                                        //order will be filled by this order only but this also could apply for
+                                        let fill = Fill::new(
+                                            "fill_123".to_string(),
+                                            order.user_id.clone(),
+                                            order.order_id.clone(),
+                                            o.user_id.clone(),
+                                            o.order_id.clone(),
+                                            o.quantity,
+                                            order.order_type.clone(),
+                                            Buy.clone(),
+                                            order.symbol.clone(),
+                                            order.quantity,
+                                            book_order_price,
+                                            Utc::now().timestamp_millis() as u32,
+                                        );
+
+                                        new_order.fills.push(fill);
+
+                                        //TODO: increase the fill , decrease matched quantity
+
+                                        //TODO:  push fill to fill array
+                                        // returing, remove from book
+
+                                        if order.side == Buy {
+                                            let ask_orders =
+                                                self.asks.get_mut(&book_order_price).unwrap();
+
+                                            println!("ask_orders: {:?}:", ask_orders);
+
+                                            let index = ask_orders
+                                                .iter()
+                                                .position(|ord| ord.clone() == o.clone())
+                                                .unwrap();
+
+                                            println!("matched order index: {}", index);
+
+                                            println!(
+                                                "o_quan: {}, order_quan: {}, filled: {}",
+                                                &o.quantity, &order.quantity, &filled_quantity
+                                            );
+                                            if o.quantity > (order.quantity - filled_quantity) {
+                                                println!("if called at 407");
+                                                //decrease current order quantity
+                                                let current_ord =
+                                                    ask_orders.get_mut(index).unwrap();
+                                                current_ord.quantity -=
+                                                    order.quantity - filled_quantity;
+                                            } else {
+                                                println!("else called at 412");
+                                                println!("remove this ask order from book");
+                                                ask_orders.remove(index);
+                                                self.order_clean(
+                                                    &order.side,
+                                                    book_order_price,
+                                                    &o.order_id,
+                                                );
+                                            }
+                                            filled_quantity += order.quantity - filled_quantity;
+
+                                                status: if filled_quantity == order.quantity {
+                                                    FullyFilled
+                                                } else if filled_quantity > 0 {
+                                                    PartiallyFilled
+                                                } else {
+                                                    Accepted
+                                                },
+                                            });
+                                        } else {
+                                            let bid_orders =
+                                                self.bids.get_mut(&book_order_price).unwrap();
+
+                                            println!("bid_orders: {:?}:", bid_orders);
+
+                                            let index = bid_orders
+                                                .iter()
+                                                .position(|ord| ord.clone() == o.clone())
+                                                .unwrap();
+
+                                            if o.quantity > (order.quantity - filled_quantity) {
+                                                //decrease current order quantity
+                                                let current_ord =
+                                                    bid_orders.get_mut(index).unwrap();
+                                                current_ord.quantity -=
+                                                    (order.quantity - filled_quantity);
+                                            } else {
+                                                bid_orders.remove(index);
+                                                self.order_clean(
+                                                    &order.side,
+                                                    book_order_price,
+                                                    &o.order_id,
+                                                );
+                                            }
+                                            filled_quantity += order.quantity - filled_quantity;
+                                            //TODO: order fully filled return with fill and filled_quantity
+                                            println!("order fully filled return");
+                                            return Ok(OrderDetail {
+                                                order_id: order.order_id,
+                                                filled_quantity,
+                                                status: if filled_quantity == order.quantity {
+                                                    FullyFilled
+                                                } else if filled_quantity > 0 {
+                                                    PartiallyFilled
+                                                } else {
+                                                    Accepted
+                                                },
+                                            });
+                                        }
+                                        filled_quantity += order.quantity - filled_quantity;
+                                    } else {
+                                        println!("order will not be filled by this only");
+                                        //order will not filled by this only, just increase the fill and push to
+                                        //fills array , remote current order from book
+                                        let fill = Fill::new(
+                                            "fill_456".to_string(),
+                                            order.user_id.clone(),
+                                            order.order_id.clone(),
+                                            o.user_id.clone(),
+                                            o.order_id.clone(),
+                                            o.quantity,
+                                            order.order_type.clone(),
+                                            Buy.clone(),
+                                            order.symbol.clone(),
+                                            order.quantity,
+                                            book_order_price,
+                                            Utc::now().timestamp_millis() as u32,
+                                        );
+
+                                        new_order.fills.push(fill);
+
+                                        filled_quantity += o.quantity;
+                                        if order.side == Buy {
+                                            let ask_orders =
+                                                self.asks.get_mut(&book_order_price).unwrap();
+
+                                            println!("ask_orders: {:?}:", ask_orders);
+
+                                            let index = ask_orders
+                                                .iter()
+                                                .position(|ord| ord.clone() == o.clone())
+                                                .unwrap();
+
+                                            println!("matched order index: {}", index);
+
+                                            ask_orders.remove(index);
+
+                                            self.order_clean(
+                                                &order.side,
+                                                book_order_price,
+                                                &o.order_id,
+                                            );
+                                        } else {
+                                            let bid_orders =
+                                                self.bids.get_mut(&book_order_price).unwrap();
+
+                                            println!("bid_orders: {:?}:", bid_orders);
+
+                                            let index = bid_orders
+                                                .iter()
+                                                .position(|ord| ord.clone() == o.clone())
+                                                .unwrap();
+
+                                            println!("matched order index: {}", index);
+
+                                            bid_orders.remove(index);
+                                            self.order_clean(
+                                                &order.side,
+                                                book_order_price,
+                                                &o.order_id,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            println!("INNER LOOP End");
+                        }
                     }
-                } else {
-                    for o in book_orders.iter() {
-                        println!("looping over order: {:?}", o);
+                    None => {
+                        println!("NONE called at 727");
 
-                        //equal to order then remove from book, if remainning less then just
-                        //decrease from book
+                        if filled_quantity != order.quantity {
+                            //order is partially filled , no more liquidity left
+                            //
+
+                            if order.side == Buy {
+                                let ord_price = order.price;
+
+                                let new_open_order = OpenOrder {
+                                    request_id: order.request_id.clone(),
+                                    user_id: order.user_id.clone(),
+                                    order_id: order.order_id.clone(),
+                                    order_type: order.order_type.clone(),
+                                    side: order.side.clone(),
+                                    symbol: order.symbol.clone(),
+                                    quantity: order.quantity - filled_quantity,
+                                    price: order.price,
+                                    created_at: order.created_at,
+                                };
+                                let existing_ord = self.orders.get(&order.order_id).is_some();
+                                println!("existing_order: {}", existing_ord);
+
+                                if existing_ord {
+                                    return Err(Error::msg(
+                                        "Order already exit with this order id",
+                                    ));
+                                } else {
+                                    self.bids
+                                        .entry(ord_price)
+                                        .or_default()
+                                        .push_front(new_open_order);
+
+                                    println!("filled_quantity: {}", filled_quantity);
+
+                                    self.orders.insert(order.order_id.clone(), order.clone());
+
+                                    //TODO: Return with fills and filled quantity, book has no longer match order for this price, push remainning quantity to the book
+                                    return Ok(OrderDetail {
+                                        order_id: order.order_id,
+                                        filled_quantity,
+                                        status: if filled_quantity == order.quantity {
+                                            FullyFilled
+                                        } else if filled_quantity > 0 {
+                                            PartiallyFilled
+                                        } else {
+                                            Accepted
+                                        },
+                                    });
+                                }
+                            } else {
+                                let ord_price = order.price;
+
+                                let new_open_order = OpenOrder {
+                                    request_id: order.request_id.clone(),
+                                    user_id: order.user_id.clone(),
+                                    order_id: order.order_id.clone(),
+                                    order_type: order.order_type.clone(),
+                                    side: order.side.clone(),
+                                    symbol: order.symbol.clone(),
+                                    quantity: order.quantity - filled_quantity,
+                                    price: order.price,
+                                    created_at: order.created_at,
+                                };
+                                println!("new_open_order: {:?}", &new_open_order);
+
+                                let existing_ord = self.orders.get(&order.order_id).is_some();
+
+                                if existing_ord {
+                                    return Err(Error::msg(
+                                        "Order already exit with this order id",
+                                    ));
+                                } else {
+                                    self.asks
+                                        .entry(ord_price)
+                                        .or_default()
+                                        .push_front(new_open_order);
+
+                                    println!("filled_quantity: {}", filled_quantity);
+
+                                    self.orders.insert(order.order_id.clone(), order.clone());
+
+                                    //TODO: Return with fills and filled quantity, book has no longer match order for this price, push remainning quantity to the book
+                                    return Ok(OrderDetail {
+                                        order_id: order.order_id,
+                                        filled_quantity,
+                                        status: if filled_quantity == order.quantity {
+                                            FullyFilled
+                                        } else if filled_quantity > 0 {
+                                            PartiallyFilled
+                                        } else {
+                                            Accepted
+                                        },
+                                    });
+                                }
+                            }
+                        } else {
+                            return Ok(OrderDetail {
+                                order_id: order.order_id,
+                                filled_quantity,
+                                status: if filled_quantity == order.quantity {
+                                    FullyFilled
+                                } else if filled_quantity > 0 {
+                                    PartiallyFilled
+                                } else {
+                                    Accepted
+                                },
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn market_order_matching(&mut self, order: OpenOrder) -> Result<OrderDetail, Error> {
+        println!("order matching called");
+
+        let mut new_order = Order::new(
+            order.request_id.clone(),
+            order.user_id.clone(),
+            order.order_id.clone(),
+            order.order_type.clone(),
+            order.side.clone(),
+            order.symbol.clone(),
+            order.quantity,
+            order.price,
+            Utc::now().timestamp_millis() as u32,
+            vec![],
+        );
+
+        let mut filled_quantity = 0;
+
+        loop {
+            let ord_key_val = if order.side == Buy {
+                self.asks.first_key_value().unwrap().to_owned()
+            } else {
+                self.bids.last_key_value().unwrap().to_owned()
+            };
+
+            let book_order_price = ord_key_val.0.to_owned();
+
+            let book_orders = ord_key_val.1.clone();
+
+            println!(
+                "book_orders: {:?}, book_order_price: {}",
+                book_orders, book_order_price
+            );
+
+            let mut book_quan = 0;
+
+            let check_quan = if order.side == Buy {
+                &self.asks
+            } else {
+                &self.bids
+            };
+
+            println!("check_quan: {:?}", check_quan);
+            for (p, o) in check_quan {
+                let mut vec_quan = 0;
+
+                for i in o {
+                    if i.user_id != order.user_id {
+                        vec_quan += i.quantity;
+                    } else {
+                        continue;
+                    }
+                }
+                println!("vec_quan: {}", vec_quan);
+                book_quan += vec_quan;
+            }
+
+            println!("book_quan : {}", book_quan);
+
+            println!("order quan: {}", order.quantity);
+            // if book_quan < order.quantity {
+            //     //return not enough orders on the book
+            //     return Err(Error::msg("Not enough liquidity"));
+            // } else {
+
+            if filled_quantity < order.quantity {
+                for o in book_orders.iter().rev() {
+                    println!("looping over order: {:?}", o);
+
+                    //equal to order then remove from book, if remainning less then just
+                    //decrease from book
+
+                    if o.user_id != order.user_id {
                         if o.quantity >= (order.quantity - filled_quantity) {
                             //order will be filled by this order only but this also could apply for
                             //second iteration
-
+                            println!("will fill by this order only");
                             //TODO: generate fill id
                             let fill = Fill::new(
                                 "fill_123".to_string(),
@@ -380,7 +840,6 @@ impl Orderbook for ORDERBOOK {
                             new_order.fills.push(fill);
 
                             //TODO: increase the fill , decrease matched quantity
-                            filled_quantity += order.quantity - filled_quantity;
 
                             //TODO:  push fill to fill array
                             // returing, remove from book
@@ -398,16 +857,30 @@ impl Orderbook for ORDERBOOK {
                                 println!("matched order index: {}", index);
 
                                 if o.quantity > (order.quantity - filled_quantity) {
+                                    println!("if called 714");
                                     //decrease current order quantity
                                     let current_ord = ask_orders.get_mut(index).unwrap();
                                     current_ord.quantity -= (order.quantity - filled_quantity);
                                 } else {
+                                    println!("else called 720");
                                     ask_orders.remove(index);
-                                }
 
+                                    self.order_clean(&order.side, book_order_price, &o.order_id);
+                                }
+                                filled_quantity += order.quantity - filled_quantity;
                                 //TODO: order fully filled return with fill and filled_quantity
                                 println!("order fully filled return");
-                                return Ok(order.order_id);
+                                return Ok(OrderDetail {
+                                    order_id: order.order_id,
+                                    filled_quantity,
+                                    status: if filled_quantity == order.quantity {
+                                        FullyFilled
+                                    } else if filled_quantity > 0 {
+                                        PartiallyFilled
+                                    } else {
+                                        Accepted
+                                    },
+                                });
                             } else {
                                 let bid_orders = self.bids.get_mut(&book_order_price).unwrap();
 
@@ -426,15 +899,27 @@ impl Orderbook for ORDERBOOK {
                                     current_ord.quantity -= (order.quantity - filled_quantity);
                                 } else {
                                     bid_orders.remove(index);
-                                }
 
+                                    self.order_clean(&order.side, book_order_price, &o.order_id);
+                                }
+                                filled_quantity += order.quantity - filled_quantity;
                                 //TODO: order fully filled return with fill and filled_quantity
                                 println!("order fully filled return");
-                                return Ok(order.order_id);
+                                return Ok(OrderDetail {
+                                    order_id: order.order_id,
+                                    filled_quantity,
+                                    status: if filled_quantity == order.quantity {
+                                        FullyFilled
+                                    } else if filled_quantity > 0 {
+                                        PartiallyFilled
+                                    } else {
+                                        Accepted
+                                    },
+                                });
                             }
                         } else {
                             //order will not filled by this only, just increase the fill and push to
-                            //fills array , remote current order from book
+                            //fills array , remove current order from book
                             let fill = Fill::new(
                                 "fill_456".to_string(),
                                 order.user_id.clone(),
@@ -470,6 +955,8 @@ impl Orderbook for ORDERBOOK {
                                 println!("matched order index: {}", index);
 
                                 ask_orders.remove(index);
+
+                                self.order_clean(&order.side, book_order_price, &o.order_id);
                             } else {
                                 let bid_orders = self.bids.get_mut(&book_order_price).unwrap();
 
@@ -483,42 +970,37 @@ impl Orderbook for ORDERBOOK {
                                 println!("matched order index: {}", index);
 
                                 bid_orders.remove(index);
+
+                                self.order_clean(&order.side, book_order_price, &o.order_id);
                             }
                         }
                     }
                 }
-
-                if order.side == Buy {
-                    let ask_ords = self.asks.get(&book_order_price).unwrap();
-
-                    if ask_ords.is_empty() {
-                        self.asks.remove(&book_order_price);
-                    }
-                } else {
-                    let bid_ords = self.bids.get(&book_order_price).unwrap();
-
-                    if bid_ords.is_empty() {
-                        self.bids.remove(&book_order_price);
-                    }
-                }
             }
+            //}
         }
     }
 
-    fn market_order_matching(&mut self, order: OpenOrder) -> Result<String, Error> {
-        println!("order matching called");
+    fn order_clean(&mut self, side: &Side, book_price: u64, matched_order_id: &String) -> bool {
+        if side == &Buy {
+            let ask_ords = self.asks.get(&book_price).unwrap();
 
-        let mut new_order = Order::new(
-            order.request_id.clone(),
-            order.user_id.clone(),
-            order.order_id.clone(),
-            order.order_type.clone(),
-            order.side.clone(),
-            order.symbol.clone(),
-            order.quantity,
-            order.price,
-            Utc::now().timestamp_millis() as u32,
-            vec![],
+            if ask_ords.is_empty() {
+                self.asks.remove(&book_price);
+            }
+        } else {
+            let bid_ords = self.bids.get(&book_price).unwrap();
+
+            if bid_ords.is_empty() {
+                self.bids.remove(&book_price);
+            }
+        }
+        self.orders.remove(matched_order_id);
+        true
+    }
+}
+
+
         );
 
         let mut filled_quantity = 0;
