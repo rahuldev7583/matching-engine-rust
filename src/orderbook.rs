@@ -2,11 +2,12 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
+use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString};
 
 use crate::orderbook::{OrderType::Limit, Side::Buy};
 
-#[derive(Debug, Display, EnumString, PartialEq, Eq, Clone)]
+#[derive(Debug, Display, EnumString, PartialEq, Eq, Clone, Deserialize, Serialize)]
 pub enum Side {
     #[strum(serialize = "buy")]
     Buy,
@@ -14,7 +15,7 @@ pub enum Side {
     Sell,
 }
 
-#[derive(Debug, Display, EnumString, PartialEq, Eq, Clone)]
+#[derive(Debug, Display, EnumString, PartialEq, Eq, Clone, Deserialize, Serialize)]
 pub enum OrderType {
     #[strum(serialize = "limit")]
     Limit,
@@ -22,7 +23,7 @@ pub enum OrderType {
     Market,
 }
 
-#[derive(Debug, EnumString, PartialEq)]
+#[derive(Debug, EnumString, PartialEq, Deserialize, Serialize, Clone)]
 pub enum OrderStatus {
     #[strum(serialize = "accepted")]
     Accepted,
@@ -85,9 +86,10 @@ impl Order {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenOrder {
     pub request_id: String,
+    pub backend_id: String,
     pub user_id: String,
     pub order_id: String,
     pub order_type: OrderType,
@@ -98,7 +100,7 @@ pub struct OpenOrder {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Fill {
     pub fill_id: String,
     pub buy_user_id: String,
@@ -184,6 +186,7 @@ pub fn orderbook_mock() {
         }
         None => {
             let order = OpenOrder {
+                backend_id: "66666".to_string(),
                 request_id: "123".to_string(),
                 user_id: "345".to_string(),
                 order_id: "order_12".to_string(),

@@ -40,7 +40,9 @@ use std::{
 
 use anyhow::{Error, Ok, Result};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use strum::EnumString;
+use uuid::Uuid;
 
 use crate::orderbook::{
     Fill, ORDERBOOK, OpenOrder, Order,
@@ -54,6 +56,7 @@ pub struct OrderDetail {
     pub order_id: String,
     pub filled_quantity: u64,
     pub status: OrderStatus,
+    pub fill: Option<Fill>,
 }
 
 #[derive(Debug)]
@@ -66,7 +69,7 @@ pub struct DepthDetail {
 pub trait Orderbook {
     fn new() -> Self;
     fn create_order(&mut self, order: OpenOrder) -> Result<OrderDetail, Error>;
-    fn cancel_order(&mut self, order_id: String) -> Result<String, Error>;
+    fn cancel_order(&mut self, order_id: String) -> Result<OpenOrder, Error>;
     fn get_order(&self, order_id: String) -> Result<OpenOrder, Error>;
     fn get_depth(&self, limit: u64) -> DepthDetail;
     fn limit_order_matching(&mut self, order: OpenOrder) -> Result<OrderDetail, Error>;
@@ -74,7 +77,7 @@ pub trait Orderbook {
     fn order_clean(&mut self, side: &Side, book_price: u64, matated_order_id: &String) -> bool;
 }
 
-#[derive(Debug)]
+#[derive(Deserialize, Debug, PartialEq, Serialize, Clone)]
 pub struct Depth {
     pub price: u64,
     pub quantity: u64,
@@ -148,7 +151,7 @@ impl Orderbook for ORDERBOOK {
         }
     }
 
-    fn cancel_order(&mut self, order_id: String) -> Result<String, Error> {
+    fn cancel_order(&mut self, order_id: String) -> Result<OpenOrder, Error> {
         let order = self.orders.get(&order_id).unwrap().clone();
         println!("open order: {:?}", order);
 
@@ -172,7 +175,7 @@ impl Orderbook for ORDERBOOK {
             if bid_ords.is_empty() {
                 self.bids.remove(&order.price);
             }
-            Ok(order_id)
+            Ok(order)
         } else {
             let mut ask_orders = self.asks.get_mut(&price).unwrap();
 
@@ -190,7 +193,7 @@ impl Orderbook for ORDERBOOK {
                 self.asks.remove(&order.price);
             }
 
-            Ok(order_id)
+            Ok(order)
         }
     }
 
@@ -274,6 +277,7 @@ impl Orderbook for ORDERBOOK {
             let ord_price = order.price;
 
             let new_open_order = OpenOrder {
+                backend_id: order.backend_id.clone(),
                 request_id: order.request_id.clone(),
                 user_id: order.user_id.clone(),
                 order_id: order.order_id.clone(),
@@ -308,12 +312,14 @@ impl Orderbook for ORDERBOOK {
                     order_id: order.order_id,
                     filled_quantity,
                     status: Accepted,
+                    fill: None,
                 })
             }
         } else if order.side == Sell && self.bids.is_empty() {
             let ord_price = order.price;
 
             let new_open_order = OpenOrder {
+                backend_id: order.backend_id.clone(),
                 request_id: order.request_id.clone(),
                 user_id: order.user_id.clone(),
                 order_id: order.order_id.clone(),
@@ -343,6 +349,7 @@ impl Orderbook for ORDERBOOK {
                     order_id: order.order_id,
                     filled_quantity,
                     status: Accepted,
+                    fill: None,
                 })
             }
         } else {
@@ -378,6 +385,7 @@ impl Orderbook for ORDERBOOK {
                             let ord_price = order.price;
 
                             let new_open_order = OpenOrder {
+                                backend_id: order.backend_id.clone(),
                                 request_id: order.request_id.clone(),
                                 user_id: order.user_id.clone(),
                                 order_id: order.order_id.clone(),
@@ -417,6 +425,7 @@ impl Orderbook for ORDERBOOK {
                                         } else {
                                             Accepted
                                         },
+                                        fill: None,
                                     });
                                 } else {
                                     self.asks
@@ -437,6 +446,7 @@ impl Orderbook for ORDERBOOK {
                                         } else {
                                             Accepted
                                         },
+                                        fill: None,
                                     });
                                 }
                             }
@@ -447,12 +457,13 @@ impl Orderbook for ORDERBOOK {
                                         order_id: order.order_id,
                                         filled_quantity,
                                         status: SelfTradePrevented,
+                                        fill: None,
                                     });
                                 } else {
                                     if o.quantity >= (order.quantity - filled_quantity) {
                                         //order will be filled by this order only but this also could apply for
                                         let fill = Fill::new(
-                                            "fill_123".to_string(),
+                                            Uuid::new_v4().to_string(),
                                             order.user_id.clone(),
                                             order.order_id.clone(),
                                             o.user_id.clone(),
@@ -466,7 +477,7 @@ impl Orderbook for ORDERBOOK {
                                             Utc::now().timestamp_millis() as u32,
                                         );
 
-                                        new_order.fills.push(fill);
+                                        new_order.fills.push(fill.clone());
 
                                         //TODO: increase the fill , decrease matched quantity
 
@@ -519,6 +530,7 @@ impl Orderbook for ORDERBOOK {
                                                 } else {
                                                     Accepted
                                                 },
+                                                fill: Some(fill),
                                             });
                                         } else {
                                             let bid_orders =
@@ -558,6 +570,7 @@ impl Orderbook for ORDERBOOK {
                                                 } else {
                                                     Accepted
                                                 },
+                                                fill: Some(fill),
                                             });
                                         }
                                         filled_quantity += order.quantity - filled_quantity;
@@ -566,7 +579,7 @@ impl Orderbook for ORDERBOOK {
                                         //order will not filled by this only, just increase the fill and push to
                                         //fills array , remote current order from book
                                         let fill = Fill::new(
-                                            "fill_456".to_string(),
+                                            Uuid::new_v4().to_string(),
                                             order.user_id.clone(),
                                             order.order_id.clone(),
                                             o.user_id.clone(),
@@ -641,6 +654,7 @@ impl Orderbook for ORDERBOOK {
                                 let ord_price = order.price;
 
                                 let new_open_order = OpenOrder {
+                                    backend_id: order.backend_id.clone(),
                                     request_id: order.request_id.clone(),
                                     user_id: order.user_id.clone(),
                                     order_id: order.order_id.clone(),
@@ -679,12 +693,14 @@ impl Orderbook for ORDERBOOK {
                                         } else {
                                             Accepted
                                         },
+                                        fill: None,
                                     });
                                 }
                             } else {
                                 let ord_price = order.price;
 
                                 let new_open_order = OpenOrder {
+                                    backend_id: order.backend_id.clone(),
                                     request_id: order.request_id.clone(),
                                     user_id: order.user_id.clone(),
                                     order_id: order.order_id.clone(),
@@ -725,6 +741,7 @@ impl Orderbook for ORDERBOOK {
                                         } else {
                                             Accepted
                                         },
+                                        fill: None,
                                     });
                                 }
                             }
@@ -739,6 +756,7 @@ impl Orderbook for ORDERBOOK {
                                 } else {
                                     Accepted
                                 },
+                                fill: None,
                             });
                         }
                     }
@@ -826,7 +844,7 @@ impl Orderbook for ORDERBOOK {
                             println!("will fill by this order only");
                             //TODO: generate fill id
                             let fill = Fill::new(
-                                "fill_123".to_string(),
+                                Uuid::new_v4().to_string(),
                                 order.user_id.clone(),
                                 order.order_id.clone(),
                                 o.user_id.clone(),
@@ -840,7 +858,7 @@ impl Orderbook for ORDERBOOK {
                                 Utc::now().timestamp_millis() as u32,
                             );
 
-                            new_order.fills.push(fill);
+                            new_order.fills.push(fill.clone());
 
                             //TODO: increase the fill , decrease matched quantity
 
@@ -883,6 +901,7 @@ impl Orderbook for ORDERBOOK {
                                     } else {
                                         Accepted
                                     },
+                                    fill: Some(fill),
                                 });
                             } else {
                                 let bid_orders = self.bids.get_mut(&book_order_price).unwrap();
@@ -918,13 +937,14 @@ impl Orderbook for ORDERBOOK {
                                     } else {
                                         Accepted
                                     },
+                                    fill: Some(fill),
                                 });
                             }
                         } else {
                             //order will not filled by this only, just increase the fill and push to
                             //fills array , remove current order from book
                             let fill = Fill::new(
-                                "fill_456".to_string(),
+                                Uuid::new_v4().to_string(),
                                 order.user_id.clone(),
                                 order.order_id.clone(),
                                 o.user_id.clone(),
