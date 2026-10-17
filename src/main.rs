@@ -231,20 +231,49 @@ pub struct DepthResponse {
     timestamp: i64,
 }
 
+#[derive(Deserialize, Debug, PartialEq, Serialize, Clone)]
+pub struct Market {
+    id: u64,
+    name: String,
+    symbol: String,
+    base_asset_id: u64,
+    quote_asset_id: u64,
+    created_at: String,
+    updated_at: String,
+    r#type: String,
+    adminAdmin_id: u64,
+}
+
+#[derive(Deserialize, Debug, PartialEq, Serialize, Clone)]
+pub struct MarketResponse {
+    message: String,
+    markets: Vec<Market>,
+}
+
 fn main() {
     println!("Hello, world!");
     let mut engine_status = EngineStatus::new();
 
     dotenv().ok();
+    let body = reqwest::blocking::get("http://localhost:5000/api/exchange/markets");
+    println!("{:?}", body);
+
+    let text = body.unwrap().text().unwrap();
+
+    println!("text: {}", text);
+
+    let parsed_markets: Result<MarketResponse, SerdeJsonError> = serde_json::from_str(&text);
+
+    println!("PARSED_MARKETS: {:?}", parsed_markets);
+
+    if parsed_markets.is_ok() {
+        let markets = parsed_markets.unwrap();
+        println!("market: {:?}", markets);
+    }
 
     let REDIS_URL = env::var("REDIS_URL").expect("REDIS_URL is not defined");
 
     println!("REDIS_URL:{}", &REDIS_URL);
-
-    //TODO: call get market api
-    let markets = vec!["BTC_USDC".to_owned(), "ETH_USDC".to_owned()];
-
-    println!("markets: {:?}", markets);
 
     let mut orderbook = ORDERBOOK::new();
 
