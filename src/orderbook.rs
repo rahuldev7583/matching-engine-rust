@@ -37,6 +37,9 @@ pub enum OrderStatus {
     Cancelled,
     #[strum(serialize = "self-trade-prevented")]
     SelfTradePrevented,
+
+    #[strum(serialize = "not-found")]
+    NotFound,
 }
 
 pub struct Balance {

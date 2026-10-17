@@ -44,11 +44,16 @@ use serde::{Deserialize, Serialize};
 use strum::EnumString;
 use uuid::Uuid;
 
-use crate::orderbook::{
-    Fill, ORDERBOOK, OpenOrder, Order,
-    OrderStatus::{self, Accepted, Cancelled, FullyFilled, PartiallyFilled, SelfTradePrevented},
-    OrderType,
-    Side::{self, Buy, Sell},
+use crate::{
+    order,
+    orderbook::{
+        Fill, ORDERBOOK, OpenOrder, Order,
+        OrderStatus::{
+            self, Accepted, Cancelled, FullyFilled, PartiallyFilled, SelfTradePrevented,
+        },
+        OrderType,
+        Side::{self, Buy, Sell},
+    },
 };
 
 #[derive(Debug)]
@@ -152,48 +157,54 @@ impl Orderbook for ORDERBOOK {
     }
 
     fn cancel_order(&mut self, order_id: String) -> Result<OpenOrder, Error> {
-        let order = self.orders.get(&order_id).unwrap().clone();
+        let mut all_orders = self.orders.to_owned();
+        let order = all_orders.get_mut(&order_id);
         println!("open order: {:?}", order);
 
-        self.orders.remove(&order_id);
+        match order {
+            Some(order) => {
+                self.orders.remove(&order_id);
 
-        let price = order.price;
+                let price = order.price;
 
-        if order.side == Buy {
-            let mut bid_orders = self.bids.get_mut(&price).unwrap();
+                if order.side == Buy {
+                    let mut bid_orders = self.bids.get_mut(&price).unwrap();
 
-            let index = bid_orders
-                .iter()
-                .position(|ord| ord.clone() == order.clone())
-                .unwrap();
+                    let index = bid_orders
+                        .iter()
+                        .position(|ord| ord.clone() == order.clone())
+                        .unwrap();
 
-            println!("matched order index: {}", index);
+                    println!("matched order index: {}", index);
 
-            bid_orders.remove(index);
-            let bid_ords = self.bids.get(&order.price).unwrap();
+                    bid_orders.remove(index);
+                    let bid_ords = self.bids.get(&order.price).unwrap();
 
-            if bid_ords.is_empty() {
-                self.bids.remove(&order.price);
+                    if bid_ords.is_empty() {
+                        self.bids.remove(&order.price);
+                    }
+                    Ok(order.to_owned())
+                } else {
+                    let mut ask_orders = self.asks.get_mut(&price).unwrap();
+
+                    let index = ask_orders
+                        .iter()
+                        .position(|ord| ord.clone() == order.clone())
+                        .unwrap();
+
+                    println!("matched order index: {}", index);
+
+                    ask_orders.remove(index);
+                    let ask_ords = self.asks.get(&order.price).unwrap();
+
+                    if ask_ords.is_empty() {
+                        self.asks.remove(&order.price);
+                    }
+
+                    Ok(order.to_owned())
+                }
             }
-            Ok(order)
-        } else {
-            let mut ask_orders = self.asks.get_mut(&price).unwrap();
-
-            let index = ask_orders
-                .iter()
-                .position(|ord| ord.clone() == order.clone())
-                .unwrap();
-
-            println!("matched order index: {}", index);
-
-            ask_orders.remove(index);
-            let ask_ords = self.asks.get(&order.price).unwrap();
-
-            if ask_ords.is_empty() {
-                self.asks.remove(&order.price);
-            }
-
-            Ok(order)
+            None => Err(Error::msg("Order not found")),
         }
     }
 
