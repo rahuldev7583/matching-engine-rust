@@ -145,7 +145,6 @@ pub enum EngineCommand {
 }
 
 #[derive(Deserialize, Debug, PartialEq, Serialize, Clone)]
-
 pub struct OrderPayload {
     r#type: String,
     quantity: String,
@@ -156,10 +155,17 @@ pub struct OrderPayload {
 }
 
 #[derive(Deserialize, Debug, PartialEq, Serialize, Clone)]
+pub struct GetCancelOrderPayload {
+    symbol: String,
+    order_id: String,
+}
+
+#[derive(Deserialize, Debug, PartialEq, Serialize, Clone)]
 #[serde(untagged)]
 pub enum Payload {
-    Object(OrderPayload),
-    Text(String),
+    Order(OrderPayload),
+    GetOrCancelOrder(GetCancelOrderPayload),
+    GetDepth(String),
 }
 
 //TODO: engine request payload
@@ -258,6 +264,8 @@ fn main() {
     let body = reqwest::blocking::get("http://localhost:5000/api/exchange/markets");
     println!("{:?}", body);
 
+    let mut orderbooks: HashMap<String, ORDERBOOK> = HashMap::new();
+
     let text = body.unwrap().text().unwrap();
 
     println!("text: {}", text);
@@ -267,17 +275,19 @@ fn main() {
     println!("PARSED_MARKETS: {:?}", parsed_markets);
 
     if parsed_markets.is_ok() {
-        let markets = parsed_markets.unwrap();
-        println!("market: {:?}", markets);
+        let all_markets = parsed_markets.unwrap();
+        println!("MARKETS: {:?}", all_markets);
+
+        for m in all_markets.markets {
+            orderbooks.insert(m.symbol, ORDERBOOK::new());
+        }
     }
+
+    println!("orderbooks: {:?}", orderbooks);
 
     let REDIS_URL = env::var("REDIS_URL").expect("REDIS_URL is not defined");
 
     println!("REDIS_URL:{}", &REDIS_URL);
-
-    let mut orderbook = ORDERBOOK::new();
-
-    println!("orderbook: {:?}", orderbook);
 
     let redis_clients = RedisServics::new(REDIS_URL.clone());
 
@@ -323,8 +333,11 @@ fn main() {
                             let request_id = eng_req.request_id.clone();
 
                             let payload = match eng_req.payload.clone() {
-                                Payload::Object(order_payload) => Ok(order_payload),
-                                Payload::Text(_) => Err(Error::msg("not valid payload")),
+                                Payload::Order(order_payload) => Ok(order_payload),
+                                Payload::GetOrCancelOrder(_) => {
+                                    Err(Error::msg("not valid payload"))
+                                }
+                                Payload::GetDepth(_) => Err(Error::msg("not valid payload")),
                             };
 
                             println!("payload: {:?}", payload);
@@ -348,6 +361,7 @@ fn main() {
                                     price: price,
                                     created_at: Utc::now().timestamp_millis(),
                                 };
+                                let mut orderbook = orderbooks.get_mut(&open_order.symbol).unwrap();
                                 let ord =
                                     ORDERBOOK::create_order(&mut orderbook, open_order.clone());
 
@@ -443,14 +457,18 @@ fn main() {
                             let request_id = eng_req.request_id.clone();
 
                             let payload = match eng_req.payload.clone() {
-                                Payload::Object(order_payload) => {
+                                Payload::Order(order_payload) => {
                                     Err(Error::msg("not valid payload"))
                                 }
-                                Payload::Text(order_id) => Ok(order_id),
+                                Payload::GetOrCancelOrder(order) => Ok(order),
+                                Payload::GetDepth(_) => Err(Error::msg("not valid payload")),
                             };
 
-                            if let Ok(OrderPayload) = &payload {
-                                let order_id = payload.unwrap();
+                            if let Ok(orderPayload) = &payload {
+                                let order_id = orderPayload.to_owned().order_id;
+                                let symbol = orderPayload.to_owned().symbol;
+
+                                let mut orderbook = orderbooks.get_mut(&symbol).unwrap();
                                 let ord = ORDERBOOK::cancel_order(&mut orderbook, order_id.clone());
 
                                 //TODO: here i need, EngineResponse, order, request_id, symbol
@@ -460,7 +478,7 @@ fn main() {
                                         let res_data = EngineResponse {
                                             request_id: request_id.clone(),
 
-                                            order_id: order_id,
+                                            order_id: order_id.to_owned(),
                                             filled_quantity: 0,
                                             status: Cancelled,
                                             price: 0,
@@ -545,14 +563,19 @@ fn main() {
                             let request_id = eng_req.request_id.clone();
 
                             let payload = match eng_req.payload.clone() {
-                                Payload::Object(order_payload) => {
+                                Payload::Order(order_payload) => {
                                     Err(Error::msg("not valid payload"))
                                 }
-                                Payload::Text(order_id) => Ok(order_id),
+                                Payload::GetOrCancelOrder(order) => Ok(order),
+                                Payload::GetDepth(_) => Err(Error::msg("not valid payload")),
                             };
 
                             if payload.is_ok() {
-                                let order_id = &payload.unwrap();
+                                let current_pay = payload.unwrap();
+                                let order_id = current_pay.order_id;
+                                let symbol = current_pay.symbol;
+
+                                let orderbook = orderbooks.get_mut(&symbol).unwrap();
 
                                 let order = ORDERBOOK::get_order(&orderbook, order_id.to_string());
 
@@ -607,6 +630,16 @@ fn main() {
                             let backend_id = eng_req.BACKEND_ID.clone();
                             let request_id = eng_req.request_id.clone();
 
+                            let payload = match eng_req.payload.clone() {
+                                Payload::Order(_) => Err(Error::msg("not valid payload")),
+                                Payload::GetOrCancelOrder(_) => {
+                                    Err(Error::msg("not valid payload"))
+                                }
+                                Payload::GetDepth(txt) => Ok(txt),
+                            };
+                            let symbol = &payload.unwrap();
+
+                            let orderbook = orderbooks.get_mut(symbol).unwrap();
                             let limit = 100;
                             let depth = ORDERBOOK::get_depth(&orderbook, limit);
 
@@ -661,8 +694,11 @@ fn main() {
                             let request_id = liq_req.request_id.clone();
 
                             let payload = match liq_req.payload.clone() {
-                                Payload::Object(order_payload) => Ok(order_payload),
-                                Payload::Text(_) => Err(Error::msg("not valid payload")),
+                                Payload::Order(order_payload) => Ok(order_payload),
+                                Payload::GetOrCancelOrder(_) => {
+                                    Err(Error::msg("not valid payload"))
+                                }
+                                Payload::GetDepth(_) => Err(Error::msg("not valid payload")),
                             };
 
                             if payload.is_ok() {
@@ -680,6 +716,7 @@ fn main() {
                                     price: payload.price.parse().unwrap(),
                                     created_at: Utc::now().timestamp_millis(),
                                 };
+                                let mut orderbook = orderbooks.get_mut(&open_order.symbol).unwrap();
                                 let ord =
                                     ORDERBOOK::create_order(&mut orderbook, open_order.clone());
 
@@ -799,8 +836,11 @@ fn main() {
                             let request_id = risk_req.request_id.clone();
 
                             let payload = match risk_req.payload.clone() {
-                                Payload::Object(order_payload) => Ok(order_payload),
-                                Payload::Text(_) => Err(Error::msg("not valid payload")),
+                                Payload::Order(order_payload) => Ok(order_payload),
+                                Payload::GetOrCancelOrder(_) => {
+                                    Err(Error::msg("not valid payload"))
+                                }
+                                Payload::GetDepth(_) => Err(Error::msg("not valid payload")),
                             };
 
                             if payload.is_ok() {
@@ -818,6 +858,7 @@ fn main() {
                                     price: payload.price.parse().unwrap(),
                                     created_at: Utc::now().timestamp_millis(),
                                 };
+                                let mut orderbook = orderbooks.get_mut(&open_order.symbol).unwrap();
                                 let ord =
                                     ORDERBOOK::create_order(&mut orderbook, open_order.clone());
 
@@ -918,8 +959,11 @@ fn main() {
                             let request_id = risk_req.request_id.clone();
 
                             let payload = match risk_req.payload.clone() {
-                                Payload::Object(order_payload) => Ok(order_payload),
-                                Payload::Text(_) => Err(Error::msg("not valid payload")),
+                                Payload::Order(order_payload) => Ok(order_payload),
+                                Payload::GetOrCancelOrder(_) => {
+                                    Err(Error::msg("not valid payload"))
+                                }
+                                Payload::GetDepth(_) => Err(Error::msg("not valid payload")),
                             };
 
                             if payload.is_ok() {
@@ -937,6 +981,7 @@ fn main() {
                                     price: payload.price.parse().unwrap(),
                                     created_at: Utc::now().timestamp_millis(),
                                 };
+                                let mut orderbook = orderbooks.get_mut(&open_order.symbol).unwrap();
                                 let ord =
                                     ORDERBOOK::create_order(&mut orderbook, open_order.clone());
 
@@ -1036,7 +1081,6 @@ fn main() {
             Err(e) => println!("failed to get request: {}", e),
         }
 
-        println!("orderbook: {:?}", orderbook);
         let dur = Duration::from_secs(5);
         sleep(dur);
     }
