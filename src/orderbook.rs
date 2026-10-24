@@ -178,14 +178,14 @@ pub fn orderbook_mock() {
         orders: HashMap::new(),
     };
 
-    println!("orderbook: {:?}", orderbook);
+    //    println!("orderbook: {:?}", orderbook);
     let price: u64 = 10;
 
     let orders = orderbook.asks.get(&10);
 
     match orders {
         Some(o) => {
-            println!("orderbook does have orders at this price, do the matching logic")
+            //            println!("orderbook does have orders at this price, do the matching logic")
         }
         None => {
             let order = OpenOrder {
@@ -208,5 +208,5 @@ pub fn orderbook_mock() {
         }
     }
 
-    println!("orderbook: {:?}", orderbook);
+    //    println!("orderbook: {:?}", orderbook);
 }

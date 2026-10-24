@@ -17,6 +17,7 @@ mod tests {
 
     fn order(id: &str, side: Side, order_type: OrderType, quantity: u64, price: u64) -> OpenOrder {
         OpenOrder {
+            backend_id: format!("backend-{id}"),
             request_id: format!("req-{id}"),
             user_id: format!("user-{id}"),
             order_id: id.to_string(),
@@ -253,18 +254,17 @@ mod tests {
         b.create_order(limit_sell("s1", 10, 100)).unwrap();
 
         let cancelled = b.cancel_order("s1".to_string()).unwrap();
-        assert_eq!(cancelled, "s1");
+        assert_eq!(cancelled.order_id, "s1");
 
         assert!(!b.orders.contains_key("s1"));
         assert!(b.asks.is_empty(), "ask price level should be cleaned up");
     }
 
     #[test]
-    #[should_panic]
-    fn cancel_nonexistent_order_should_not_panic() {
+    fn cancel_nonexistent_order_should_return_error() {
         let mut b = book();
         b.create_order(limit_sell("s1", 10, 100)).unwrap();
-        let _ = b.cancel_order("missing".to_string());
+        assert!(b.cancel_order("missing".to_string()).is_err());
     }
 
     #[test]
