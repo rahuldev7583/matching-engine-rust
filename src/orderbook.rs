@@ -24,6 +24,7 @@ pub enum OrderType {
 }
 
 #[derive(Debug, EnumString, PartialEq, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "snake_case")]
 pub enum OrderStatus {
     #[strum(serialize = "accepted")]
     Accepted,

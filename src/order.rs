@@ -61,7 +61,7 @@ pub struct OrderDetail {
     pub order_id: String,
     pub filled_quantity: u64,
     pub status: OrderStatus,
-    pub fill: Option<Fill>,
+    pub fills: Vec<Fill>,
 }
 
 #[derive(Debug)]
@@ -323,7 +323,7 @@ impl Orderbook for ORDERBOOK {
                     order_id: order.order_id,
                     filled_quantity,
                     status: Accepted,
-                    fill: None,
+                    fills: new_order.fills.clone(),
                 })
             }
         } else if order.side == Sell && self.bids.is_empty() {
@@ -360,7 +360,7 @@ impl Orderbook for ORDERBOOK {
                     order_id: order.order_id,
                     filled_quantity,
                     status: Accepted,
-                    fill: None,
+                    fills: new_order.fills.clone(),
                 })
             }
         } else {
@@ -436,7 +436,7 @@ impl Orderbook for ORDERBOOK {
                                         } else {
                                             Accepted
                                         },
-                                        fill: None,
+                                        fills: new_order.fills.clone(),
                                     });
                                 } else {
                                     self.asks
@@ -457,7 +457,7 @@ impl Orderbook for ORDERBOOK {
                                         } else {
                                             Accepted
                                         },
-                                        fill: None,
+                                        fills: new_order.fills.clone(),
                                     });
                                 }
                             }
@@ -468,7 +468,7 @@ impl Orderbook for ORDERBOOK {
                                         order_id: order.order_id,
                                         filled_quantity,
                                         status: SelfTradePrevented,
-                                        fill: None,
+                                        fills: new_order.fills.clone(),
                                     });
                                 } else {
                                     if o.quantity >= (order.quantity - filled_quantity) {
@@ -541,7 +541,7 @@ impl Orderbook for ORDERBOOK {
                                                 } else {
                                                     Accepted
                                                 },
-                                                fill: Some(fill),
+                                                fills: new_order.fills.clone(),
                                             });
                                         } else {
                                             let bid_orders =
@@ -581,7 +581,7 @@ impl Orderbook for ORDERBOOK {
                                                 } else {
                                                     Accepted
                                                 },
-                                                fill: Some(fill),
+                                                fills: new_order.fills.clone(),
                                             });
                                         }
                                         filled_quantity += order.quantity - filled_quantity;
@@ -704,7 +704,7 @@ impl Orderbook for ORDERBOOK {
                                         } else {
                                             Accepted
                                         },
-                                        fill: None,
+                                        fills: new_order.fills.clone(),
                                     });
                                 }
                             } else {
@@ -752,7 +752,7 @@ impl Orderbook for ORDERBOOK {
                                         } else {
                                             Accepted
                                         },
-                                        fill: None,
+                                        fills: new_order.fills.clone(),
                                     });
                                 }
                             }
@@ -767,7 +767,7 @@ impl Orderbook for ORDERBOOK {
                                 } else {
                                     Accepted
                                 },
-                                fill: None,
+                                fills: new_order.fills.clone(),
                             });
                         }
                     }
@@ -912,7 +912,7 @@ impl Orderbook for ORDERBOOK {
                                     } else {
                                         Accepted
                                     },
-                                    fill: Some(fill),
+                                    fills: new_order.fills.clone(),
                                 });
                             } else {
                                 let bid_orders = self.bids.get_mut(&book_order_price).unwrap();
@@ -948,7 +948,7 @@ impl Orderbook for ORDERBOOK {
                                     } else {
                                         Accepted
                                     },
-                                    fill: Some(fill),
+                                    fills: new_order.fills.clone(),
                                 });
                             }
                         } else {

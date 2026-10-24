@@ -146,7 +146,7 @@ pub enum EngineCommand {
 pub struct OrderPayload {
     r#type: String,
     quantity: String,
-    price: String,
+    price: Option<String>,
     symbol: String,
     user_id: u64,
     side: String, // command: Option<String>,
@@ -188,11 +188,13 @@ pub struct EngineResponse {
     pub request_id: String,
     pub order_id: String,
     pub filled_quantity: u64,
+    pub remaining_quantity: u64,
     pub status: OrderStatus,
     pub price: u64,
     pub message: String,
 
     pub data: Option<OpenOrder>,
+    pub fills: Vec<Fill>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Clone)]
@@ -254,33 +256,57 @@ pub struct MarketResponse {
     markets: Vec<Market>,
 }
 
+// Fixture format (ENGINE_CONTRACT.md §5): {"markets":[{"symbol":"BTC_USDC"},...]}
+#[derive(Deserialize)]
+struct Fixture {
+    markets: Vec<FixtureMarket>,
+}
+
+#[derive(Deserialize)]
+struct FixtureMarket {
+    symbol: String,
+}
+
+// Load market symbols from MARKETS_FIXTURE (inline JSON or a file path).
+fn load_fixture_symbols() -> Option<Vec<String>> {
+    let raw = env::var("MARKETS_FIXTURE").ok()?;
+    let trimmed = raw.trim();
+    let text = if trimmed.starts_with('{') {
+        trimmed.to_string()
+    } else {
+        std::fs::read_to_string(trimmed).ok()?
+    };
+    let fixture: Fixture = serde_json::from_str(&text).ok()?;
+    Some(fixture.markets.into_iter().map(|m| m.symbol).collect())
+}
+
 fn main() {
     // println!("Hello, world!");
     let mut engine_status = EngineStatus::new();
 
     dotenv().ok();
 
-    let BACKEND_URL = env::var("BACKEND_URL").expect("BACKEND_URL is not defined");
-    let body = reqwest::blocking::get(BACKEND_URL);
-
-    // println!("{:?}", body);
+    let verbose = env::var("VERBOSE_LOGGING").map(|v| v == "true").unwrap_or(false);
 
     let mut orderbooks: HashMap<String, ORDERBOOK> = HashMap::new();
 
-    let text = body.unwrap().text().unwrap();
+    if let Some(symbols) = load_fixture_symbols() {
+        for symbol in symbols {
+            orderbooks.insert(symbol, ORDERBOOK::new());
+        }
+    } else {
+        let BACKEND_URL = env::var("BACKEND_URL").expect("BACKEND_URL is not defined");
+        let body = reqwest::blocking::get(BACKEND_URL);
 
-    // println!("text: {}", text);
+        let text = body.unwrap().text().unwrap();
 
-    let parsed_markets: Result<MarketResponse, SerdeJsonError> = serde_json::from_str(&text);
+        let parsed_markets: Result<MarketResponse, SerdeJsonError> = serde_json::from_str(&text);
 
-    // println!("PARSED_MARKETS: {:?}", parsed_markets);
-
-    if parsed_markets.is_ok() {
-        let all_markets = parsed_markets.unwrap();
-        // println!("MARKETS: {:?}", all_markets);
-
-        for m in all_markets.markets {
-            orderbooks.insert(m.symbol, ORDERBOOK::new());
+        if parsed_markets.is_ok() {
+            let all_markets = parsed_markets.unwrap();
+            for m in all_markets.markets {
+                orderbooks.insert(m.symbol, ORDERBOOK::new());
+            }
         }
     }
 
@@ -305,8 +331,8 @@ fn main() {
 
     loop {
         let request: Result<(String, String), RedisError> = cmd("BRPOP")
-            .arg(INCOMING_QUEUE)
             .arg(LIQUIDATION_QUEUE)
+            .arg(INCOMING_QUEUE)
             .arg(RISK_QUEUE)
             .arg(0.1)
             .query(&mut client);
@@ -339,12 +365,24 @@ fn main() {
                             &mut db_worker_client,
                             &mut risk_engine_pub_client,
                         ),
-                        _ => println!("unexpected queue: {key}"),
+                        _ => {
+                            if verbose {
+                                println!("unexpected queue: {key}");
+                            }
+                        }
                     },
-                    Err(e) => println!("failed to parse request: {e}"),
+                    Err(e) => {
+                        if verbose {
+                            println!("failed to parse request: {e}");
+                        }
+                    }
                 }
             }
-            Err(e) => println!("RedisError: {e}"),
+            Err(e) => {
+                if verbose {
+                    println!("RedisError: {e}");
+                }
+            }
         }
     }
 }
@@ -370,7 +408,11 @@ fn process_incoming(
             if payload.is_ok() {
                 let payload = payload.unwrap();
                 let (price, quantity): (u64, u64) = (
-                    payload.price.trim().parse().unwrap(),
+                    payload
+                        .price
+                        .as_deref()
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(0),
                     payload.quantity.parse().unwrap(),
                 );
 
@@ -395,15 +437,14 @@ fn process_incoming(
                             request_id: request_id.clone(),
                             order_id: open_order.order_id,
                             filled_quantity: order_detail.filled_quantity,
+                            remaining_quantity: open_order.quantity - order_detail.filled_quantity,
                             status: order_detail.status,
                             price: open_order.price,
                             message: "Order created successfully".to_string(),
                             data: None,
+                            fills: order_detail.fills.clone(),
                         };
-                        let fill = order_detail.fill;
-
-                        if fill.is_some() {
-                            let current_fill = fill.unwrap();
+                        for current_fill in &order_detail.fills {
                             let payload_res = DBPayload::Engine(payload_res_data.clone());
 
                             let db_res_data = DBWorkerResponse {
@@ -411,7 +452,7 @@ fn process_incoming(
                                 fill: Some(current_fill.clone()),
                                 payload: payload_res,
                                 request_type: None,
-                                order_id: order_detail.order_id,
+                                order_id: order_detail.order_id.clone(),
                                 command: "create-fill".to_string(),
                                 order: None,
                             };
@@ -422,7 +463,7 @@ fn process_incoming(
                             db_worker_client.lpush::<_, _, ()>("settlement-queue", db_res_json);
 
                             let risk_res_data = RiskEngineResponse {
-                                fill: Some(current_fill),
+                                fill: Some(current_fill.clone()),
                                 command: "fill-order".to_string(),
                                 order: None,
                             };
@@ -437,7 +478,7 @@ fn process_incoming(
                         let res_json: String = serde_json::to_string(&payload_res_data)
                             .expect("Failed to convert JSON");
 
-                        let res_queue: String = format!("response-queue-{backend_id}-{request_id}");
+                        let res_queue: String = format!("response-queue-{backend_id}");
 
                         publish_client.lpush::<_, _, ()>(res_queue, res_json);
                     }
@@ -446,16 +487,18 @@ fn process_incoming(
                             request_id: request_id.clone(),
                             order_id: open_order.order_id,
                             filled_quantity: 0,
+                            remaining_quantity: open_order.quantity,
                             status: Rejected,
                             price: open_order.price,
                             message: e.to_string(),
                             data: None,
+                            fills: vec![],
                         };
 
                         let res_json: String =
                             serde_json::to_string(&res_data).expect("Failed to convert JSON");
 
-                        let res_queue: String = format!("response-queue-{backend_id}-{request_id}");
+                        let res_queue: String = format!("response-queue-{backend_id}");
 
                         publish_client.lpush::<_, _, ()>(res_queue, res_json);
                     }
@@ -485,16 +528,18 @@ fn process_incoming(
                             request_id: request_id.clone(),
                             order_id: order_id.to_owned(),
                             filled_quantity: 0,
+                            remaining_quantity: ord.quantity,
                             status: Cancelled,
                             price: 0,
                             message: "Order cancelled".to_string(),
                             data: None,
+                            fills: vec![],
                         };
 
                         let res_json: String =
                             serde_json::to_string(&res_data).expect("Failed to convert JSON");
 
-                        let res_queue: String = format!("response-queue-{backend_id}-{request_id}");
+                        let res_queue: String = format!("response-queue-{backend_id}");
 
                         publish_client.lpush::<_, _, ()>(res_queue, res_json);
 
@@ -531,21 +576,23 @@ fn process_incoming(
                             .lpush::<_, _, ()>("matching-to-risk-pub-queue", risk_res_json);
                     }
                     Err(_) => {
-                        println!("failed to get order");
+                        // println!("failed to get order");
                         let res_data = EngineResponse {
                             request_id: request_id.clone(),
                             order_id: order_id.to_string(),
                             filled_quantity: 0,
+                            remaining_quantity: 0,
                             status: NotFound,
                             price: 0,
                             message: "Order not found".to_string(),
                             data: None,
+                            fills: vec![],
                         };
 
                         let res_json: String =
                             serde_json::to_string(&res_data).expect("Failed to convert JSON");
 
-                        let res_queue: String = format!("response-queue-{backend_id}-{request_id}");
+                        let res_queue: String = format!("response-queue-{backend_id}");
 
                         publish_client.lpush::<_, _, ()>(res_queue, res_json);
                     }
@@ -577,35 +624,39 @@ fn process_incoming(
                             request_id: request_id.clone(),
                             order_id: order_id.to_string(),
                             filled_quantity: 0,
+                            remaining_quantity: o.quantity,
                             status: Accepted,
                             price: 0,
                             message: "Order sitting on book".to_string(),
                             data: Some(o),
+                            fills: vec![],
                         };
 
                         let res_json: String =
                             serde_json::to_string(&res_data).expect("Failed to convert JSON");
 
-                        let res_queue: String = format!("response-queue-{backend_id}-{request_id}");
+                        let res_queue: String = format!("response-queue-{backend_id}");
 
                         publish_client.lpush::<_, _, ()>(res_queue, res_json);
                     }
                     Err(_) => {
-                        println!("failed to get order");
+                        // println!("failed to get order");
                         let res_data = EngineResponse {
                             request_id: request_id.clone(),
                             order_id: order_id.to_string(),
                             filled_quantity: 0,
+                            remaining_quantity: 0,
                             status: NotFound,
                             price: 0,
                             message: "Order not found".to_string(),
                             data: None,
+                            fills: vec![],
                         };
 
                         let res_json: String =
                             serde_json::to_string(&res_data).expect("Failed to convert JSON");
 
-                        let res_queue: String = format!("response-queue-{backend_id}-{request_id}");
+                        let res_queue: String = format!("response-queue-{backend_id}");
 
                         publish_client.lpush::<_, _, ()>(res_queue, res_json);
                     }
@@ -637,7 +688,7 @@ fn process_incoming(
             let res_json: String =
                 serde_json::to_string(&res_data).expect("Failed to convert JSON");
 
-            let res_queue: String = format!("response-queue-{backend_id}-{request_id}");
+            let res_queue: String = format!("response-queue-{backend_id}");
 
             publish_client.lpush::<_, _, ()>(res_queue, res_json);
         }
@@ -683,7 +734,11 @@ fn process_liquidation(
                     side: Side::from_str(&payload.side).unwrap(),
                     symbol: payload.symbol,
                     quantity: payload.quantity.parse().unwrap(),
-                    price: payload.price.parse().unwrap(),
+                    price: payload
+                        .price
+                        .as_deref()
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(0),
                     created_at: Utc::now().timestamp_millis(),
                 };
                 let mut orderbook = orderbooks.get_mut(&open_order.symbol).unwrap();
@@ -695,14 +750,14 @@ fn process_liquidation(
                             request_id: request_id.clone(),
                             order_id: open_order.order_id,
                             filled_quantity: order_detail.filled_quantity,
+                            remaining_quantity: open_order.quantity - order_detail.filled_quantity,
                             status: order_detail.status,
                             price: open_order.price,
                             message: "Order created successfully".to_string(),
                             data: None,
+                            fills: order_detail.fills.clone(),
                         };
-                        let fill = order_detail.fill;
-
-                        if let Some(current_fill) = fill {
+                        for current_fill in &order_detail.fills {
                             let payload_res = DBPayload::Engine(payload_res_data.clone());
 
                             let db_res_data = DBWorkerResponse {
@@ -710,7 +765,7 @@ fn process_liquidation(
                                 fill: Some(current_fill.clone()),
                                 payload: payload_res,
                                 request_type: Some(OrderRequestType::Perp),
-                                order_id: order_detail.order_id,
+                                order_id: order_detail.order_id.clone(),
                                 command: "create-fill".to_string(),
                                 order: None,
                             };
@@ -721,7 +776,7 @@ fn process_liquidation(
                             db_worker_client.lpush::<_, _, ()>("settlement-queue", db_res_json);
 
                             let risk_res_data = RiskEngineResponse {
-                                fill: Some(current_fill),
+                                fill: Some(current_fill.clone()),
                                 command: "fill-order".to_string(),
                                 order: None,
                             };
@@ -736,7 +791,7 @@ fn process_liquidation(
                         let res_json: String = serde_json::to_string(&payload_res_data)
                             .expect("Failed to convert JSON");
 
-                        let res_queue: String = format!("response-queue-{backend_id}-{request_id}");
+                        let res_queue: String = format!("response-queue-{backend_id}");
 
                         publish_client.lpush::<_, _, ()>(res_queue, res_json);
                     }
@@ -745,16 +800,18 @@ fn process_liquidation(
                             request_id: request_id.clone(),
                             order_id: open_order.order_id,
                             filled_quantity: 0,
+                            remaining_quantity: open_order.quantity,
                             status: Rejected,
                             price: open_order.price,
                             message: e.to_string(),
                             data: None,
+                            fills: vec![],
                         };
 
                         let res_json: String =
                             serde_json::to_string(&res_data).expect("Failed to convert JSON");
 
-                        let res_queue: String = format!("response-queue-{backend_id}-{request_id}");
+                        let res_queue: String = format!("response-queue-{backend_id}");
 
                         publish_client.lpush::<_, _, ()>(res_queue, res_json);
                     }
@@ -795,7 +852,11 @@ fn process_risk(
                     side: Side::from_str(&payload.side).unwrap(),
                     symbol: payload.symbol,
                     quantity: payload.quantity.parse().unwrap(),
-                    price: payload.price.parse().unwrap(),
+                    price: payload
+                        .price
+                        .as_deref()
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(0),
                     created_at: Utc::now().timestamp_millis(),
                 };
                 let mut orderbook = orderbooks.get_mut(&open_order.symbol).unwrap();
@@ -807,15 +868,14 @@ fn process_risk(
                             request_id: request_id.clone(),
                             order_id: open_order.order_id,
                             filled_quantity: order_detail.filled_quantity,
+                            remaining_quantity: open_order.quantity - order_detail.filled_quantity,
                             status: order_detail.status,
                             price: open_order.price,
                             message: "Order created successfully".to_string(),
                             data: None,
+                            fills: order_detail.fills.clone(),
                         };
-                        let fill = order_detail.fill;
-
-                        if fill.is_some() {
-                            let current_fill = fill.unwrap();
+                        for current_fill in &order_detail.fills {
                             let payload_res = DBPayload::Engine(payload_res_data.clone());
 
                             let db_res_data = DBWorkerResponse {
@@ -823,7 +883,7 @@ fn process_risk(
                                 fill: Some(current_fill.clone()),
                                 payload: payload_res,
                                 request_type: Some(OrderRequestType::Perp),
-                                order_id: order_detail.order_id,
+                                order_id: order_detail.order_id.clone(),
                                 command: "create-fill".to_string(),
                                 order: None,
                             };
@@ -834,7 +894,7 @@ fn process_risk(
                             db_worker_client.lpush::<_, _, ()>("settlement-queue", db_res_json);
 
                             let risk_res_data = RiskEngineResponse {
-                                fill: Some(current_fill),
+                                fill: Some(current_fill.clone()),
                                 command: "fill-order".to_string(),
                                 order: None,
                             };
@@ -849,7 +909,7 @@ fn process_risk(
                         let res_json: String = serde_json::to_string(&payload_res_data)
                             .expect("Failed to convert JSON");
 
-                        let res_queue: String = format!("response-queue-{backend_id}-{request_id}");
+                        let res_queue: String = format!("response-queue-{backend_id}");
 
                         publish_client.lpush::<_, _, ()>(res_queue, res_json);
                     }
@@ -858,16 +918,18 @@ fn process_risk(
                             request_id: request_id.clone(),
                             order_id: open_order.order_id,
                             filled_quantity: 0,
+                            remaining_quantity: open_order.quantity,
                             status: Rejected,
                             price: open_order.price,
                             message: e.to_string(),
                             data: None,
+                            fills: vec![],
                         };
 
                         let res_json: String =
                             serde_json::to_string(&res_data).expect("Failed to convert JSON");
 
-                        let res_queue: String = format!("response-queue-{backend_id}-{request_id}");
+                        let res_queue: String = format!("response-queue-{backend_id}");
 
                         publish_client.lpush::<_, _, ()>(res_queue, res_json);
                     }
@@ -901,7 +963,11 @@ fn process_risk(
                     side: Side::from_str(&payload.side).unwrap(),
                     symbol: payload.symbol,
                     quantity: payload.quantity.parse().unwrap(),
-                    price: payload.price.parse().unwrap(),
+                    price: payload
+                        .price
+                        .as_deref()
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(0),
                     created_at: Utc::now().timestamp_millis(),
                 };
                 let mut orderbook = orderbooks.get_mut(&open_order.symbol).unwrap();
@@ -913,15 +979,14 @@ fn process_risk(
                             request_id: request_id.clone(),
                             order_id: open_order.order_id,
                             filled_quantity: order_detail.filled_quantity,
+                            remaining_quantity: open_order.quantity - order_detail.filled_quantity,
                             status: order_detail.status,
                             price: open_order.price,
                             message: "Order created successfully".to_string(),
                             data: None,
+                            fills: order_detail.fills.clone(),
                         };
-                        let fill = order_detail.fill;
-
-                        if fill.is_some() {
-                            let current_fill = fill.unwrap();
+                        for current_fill in &order_detail.fills {
                             let payload_res = DBPayload::Engine(payload_res_data.clone());
 
                             let db_res_data = DBWorkerResponse {
@@ -929,7 +994,7 @@ fn process_risk(
                                 fill: Some(current_fill.clone()),
                                 payload: payload_res,
                                 request_type: Some(OrderRequestType::Perp),
-                                order_id: order_detail.order_id,
+                                order_id: order_detail.order_id.clone(),
                                 command: "close-position".to_string(),
                                 order: None,
                             };
@@ -940,7 +1005,7 @@ fn process_risk(
                             db_worker_client.lpush::<_, _, ()>("settlement-queue", db_res_json);
 
                             let risk_res_data = RiskEngineResponse {
-                                fill: Some(current_fill),
+                                fill: Some(current_fill.clone()),
                                 command: "fill-order".to_string(),
                                 order: None,
                             };
@@ -955,7 +1020,7 @@ fn process_risk(
                         let res_json: String = serde_json::to_string(&payload_res_data)
                             .expect("Failed to convert JSON");
 
-                        let res_queue: String = format!("response-queue-{backend_id}-{request_id}");
+                        let res_queue: String = format!("response-queue-{backend_id}");
 
                         publish_client.lpush::<_, _, ()>(res_queue, res_json);
                     }
@@ -964,16 +1029,18 @@ fn process_risk(
                             request_id: request_id.clone(),
                             order_id: open_order.order_id,
                             filled_quantity: 0,
+                            remaining_quantity: open_order.quantity,
                             status: Rejected,
                             price: open_order.price,
                             message: e.to_string(),
                             data: None,
+                            fills: vec![],
                         };
 
                         let res_json: String =
                             serde_json::to_string(&res_data).expect("Failed to convert JSON");
 
-                        let res_queue: String = format!("response-queue-{backend_id}-{request_id}");
+                        let res_queue: String = format!("response-queue-{backend_id}");
 
                         publish_client.lpush::<_, _, ()>(res_queue, res_json);
                     }
