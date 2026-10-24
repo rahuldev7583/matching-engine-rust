@@ -157,14 +157,11 @@ impl Orderbook for ORDERBOOK {
     }
 
     fn cancel_order(&mut self, order_id: String) -> Result<OpenOrder, Error> {
-        let mut all_orders = self.orders.to_owned();
-        let order = all_orders.get_mut(&order_id);
+        let order = self.orders.remove(&order_id);
         //        println!("open order: {:?}", order);
 
         match order {
             Some(order) => {
-                self.orders.remove(&order_id);
-
                 let price = order.price;
 
                 if order.side == Buy {
@@ -172,7 +169,7 @@ impl Orderbook for ORDERBOOK {
 
                     let index = bid_orders
                         .iter()
-                        .position(|ord| ord.clone() == order.clone())
+                        .position(|ord| ord.order_id == order_id)
                         .unwrap();
 
                     //                    println!("matched order index: {}", index);
@@ -183,13 +180,13 @@ impl Orderbook for ORDERBOOK {
                     if bid_ords.is_empty() {
                         self.bids.remove(&order.price);
                     }
-                    Ok(order.to_owned())
+                    Ok(order)
                 } else {
                     let mut ask_orders = self.asks.get_mut(&price).unwrap();
 
                     let index = ask_orders
                         .iter()
-                        .position(|ord| ord.clone() == order.clone())
+                        .position(|ord| ord.order_id == order_id)
                         .unwrap();
 
                     //                    println!("matched order index: {}", index);
@@ -201,7 +198,7 @@ impl Orderbook for ORDERBOOK {
                         self.asks.remove(&order.price);
                     }
 
-                    Ok(order.to_owned())
+                    Ok(order)
                 }
             }
             None => Err(Error::msg("Order not found")),
@@ -479,7 +476,7 @@ impl Orderbook for ORDERBOOK {
                                             order.order_id.clone(),
                                             o.user_id.clone(),
                                             o.order_id.clone(),
-                                            o.quantity,
+                                            order.quantity - filled_quantity,
                                             order.order_type.clone(),
                                             Buy.clone(),
                                             order.symbol.clone(),
@@ -860,7 +857,7 @@ impl Orderbook for ORDERBOOK {
                                 order.order_id.clone(),
                                 o.user_id.clone(),
                                 o.order_id.clone(),
-                                o.quantity,
+                                order.quantity - filled_quantity,
                                 order.order_type.clone(),
                                 Buy.clone(),
                                 order.symbol.clone(),
