@@ -363,6 +363,7 @@ fn main() {
                         if verbose {
                             println!("failed to parse request: {e}");
                         }
+                        reject_unparseable(&value, &publisher);
                     }
                 }
             }
@@ -373,6 +374,22 @@ fn main() {
             }
         }
     }
+}
+
+// A request that cannot be parsed still gets an answer when it names a response queue,
+// so the caller does not wait forever.
+fn reject_unparseable(raw: &str, publisher: &Publisher) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return;
+    };
+    let (Some(backend_id), Some(request_id)) = (
+        v.get("BACKEND_ID").and_then(|x| x.as_str()),
+        v.get("request_id").and_then(|x| x.as_str()),
+    ) else {
+        return;
+    };
+    let res = empty_response(request_id, "", Rejected, "Invalid request");
+    publish_response(publisher, backend_id, &res);
 }
 
 fn response_queue(backend_id: &str) -> String {
@@ -628,6 +645,8 @@ fn handle_cancel_order(
     let backend_id = &eng_req.BACKEND_ID;
     let request_id = &eng_req.request_id;
     let Some((order_id, hint)) = order_id_and_symbol(&eng_req.payload) else {
+        let res = empty_response(request_id, "", Rejected, "Invalid payload");
+        publish_response(publisher, backend_id, &res);
         return;
     };
 
@@ -788,5 +807,42 @@ fn process_risk(
             "close-position",
         ),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> EngineRequest {
+        serde_json::from_str(json).expect("request must parse")
+    }
+
+    #[test]
+    fn cancel_with_bare_order_id_payload() {
+        let r = parse(r#"{"BACKEND_ID":"b","request_id":"r","command":"cancel-order","payload":"abc"}"#);
+        assert_eq!(order_id_and_symbol(&r.payload), Some(("abc".to_string(), None)));
+    }
+
+    #[test]
+    fn cancel_with_symbol_and_order_id_payload() {
+        let r = parse(r#"{"BACKEND_ID":"b","request_id":"r","command":"cancel-order","payload":{"symbol":"S","order_id":"abc"}}"#);
+        assert_eq!(
+            order_id_and_symbol(&r.payload),
+            Some(("abc".to_string(), Some("S".to_string())))
+        );
+    }
+
+    #[test]
+    fn cancel_with_order_payload_has_no_order_id() {
+        let r = parse(r#"{"BACKEND_ID":"b","request_id":"r","command":"cancel-order","payload":{"type":"limit","quantity":"1","price":"1","symbol":"S","user_id":1,"side":"buy"}}"#);
+        assert_eq!(order_id_and_symbol(&r.payload), None);
+    }
+
+    #[test]
+    fn find_symbol_returns_none_for_unknown_order() {
+        let mut books: HashMap<String, ORDERBOOK> = HashMap::new();
+        books.insert("S".to_string(), ORDERBOOK::new());
+        assert_eq!(find_symbol(&books, "missing", None), None);
     }
 }
