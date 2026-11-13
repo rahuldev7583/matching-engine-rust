@@ -7,9 +7,12 @@ use std::{
     time::Duration,
 };
 
+mod publisher;
+
 use anyhow::{Error, Result};
 use chrono::Utc;
 use dotenvy::dotenv;
+use publisher::Publisher;
 use redis::{Commands, Connection, JsonCommands, RedisError, cmd};
 use serde::{Deserialize, Serialize, de::value::Error as SerdeError};
 use serde_json::Error as SerdeJsonError;
@@ -281,12 +284,13 @@ fn load_fixture_symbols() -> Option<Vec<String>> {
 }
 
 fn main() {
-    // println!("Hello, world!");
     let mut engine_status = EngineStatus::new();
 
     dotenv().ok();
 
-    let verbose = env::var("VERBOSE_LOGGING").map(|v| v == "true").unwrap_or(false);
+    let verbose = env::var("VERBOSE_LOGGING")
+        .map(|v| v == "true")
+        .unwrap_or(false);
 
     let mut orderbooks: HashMap<String, ORDERBOOK> = HashMap::new();
 
@@ -310,31 +314,31 @@ fn main() {
         }
     }
 
-    // println!("orderbooks: {:?}", orderbooks);
-
     let REDIS_URL = env::var("REDIS_URL").expect("REDIS_URL is not defined");
-
-    // println!("REDIS_URL:{}", &REDIS_URL);
-
-    let redis_clients = RedisServics::new(REDIS_URL.clone());
-
-    // println!("redis services");
 
     let RedisServics {
         mut client,
-        mut publish_client,
-        mut db_worker_client,
-        mut risk_engine_pub_client,
-    } = redis_clients;
+        publish_client,
+        db_worker_client,
+        risk_engine_pub_client,
+    } = RedisServics::new(REDIS_URL.clone());
 
-    // println!("ALL REDIS SERVICES CONNECTED");
+    // Writes never block the matching thread (ENGINE_CONTRACT.md §4).
+    let publisher = Publisher::new(
+        &REDIS_URL,
+        publish_client,
+        db_worker_client,
+        risk_engine_pub_client,
+        verbose,
+    );
 
     loop {
+        // Timeout 0 blocks until a request arrives
         let request: Result<(String, String), RedisError> = cmd("BRPOP")
             .arg(LIQUIDATION_QUEUE)
             .arg(INCOMING_QUEUE)
             .arg(RISK_QUEUE)
-            .arg(0.1)
+            .arg(0)
             .query(&mut client);
 
         match request {
@@ -344,27 +348,11 @@ fn main() {
 
                 match parsed_val {
                     Ok(eng_req) => match key.as_str() {
-                        INCOMING_QUEUE => process_incoming(
-                            eng_req,
-                            &mut orderbooks,
-                            &mut publish_client,
-                            &mut db_worker_client,
-                            &mut risk_engine_pub_client,
-                        ),
-                        LIQUIDATION_QUEUE => process_liquidation(
-                            eng_req,
-                            &mut orderbooks,
-                            &mut publish_client,
-                            &mut db_worker_client,
-                            &mut risk_engine_pub_client,
-                        ),
-                        RISK_QUEUE => process_risk(
-                            eng_req,
-                            &mut orderbooks,
-                            &mut publish_client,
-                            &mut db_worker_client,
-                            &mut risk_engine_pub_client,
-                        ),
+                        INCOMING_QUEUE => process_incoming(eng_req, &mut orderbooks, &publisher),
+                        LIQUIDATION_QUEUE => {
+                            process_liquidation(eng_req, &mut orderbooks, &publisher)
+                        }
+                        RISK_QUEUE => process_risk(eng_req, &mut orderbooks, &publisher),
                         _ => {
                             if verbose {
                                 println!("unexpected queue: {key}");
@@ -387,665 +375,418 @@ fn main() {
     }
 }
 
+fn response_queue(backend_id: &str) -> String {
+    format!("response-queue-{backend_id}")
+}
+
+fn publish_response(publisher: &Publisher, backend_id: &str, res: &EngineResponse) {
+    let json = serde_json::to_string(res).expect("Failed to convert JSON");
+    publisher.response(response_queue(backend_id), json);
+}
+
+fn publish_settlement(publisher: &Publisher, msg: &DBWorkerResponse) {
+    publisher.settlement(serde_json::to_string(msg).expect("Failed to convert to json"));
+}
+
+fn publish_risk(publisher: &Publisher, msg: &RiskEngineResponse) {
+    publisher.risk(serde_json::to_string(msg).expect("Failed to convert json"));
+}
+
+fn empty_response(
+    request_id: &str,
+    order_id: &str,
+    status: OrderStatus,
+    message: &str,
+) -> EngineResponse {
+    EngineResponse {
+        request_id: request_id.to_string(),
+        order_id: order_id.to_string(),
+        filled_quantity: 0,
+        remaining_quantity: 0,
+        status,
+        price: 0,
+        message: message.to_string(),
+        data: None,
+        fills: vec![],
+    }
+}
+
+// Create an order and publish response + side effects.
+//   request_type: Some(Perp) for liquidation/risk orders, None for spot
+//   fill_command: command recorded on settlement messages for fills
+fn handle_create_order(
+    eng_req: &EngineRequest,
+    orderbooks: &mut HashMap<String, ORDERBOOK>,
+    publisher: &Publisher,
+    request_type: Option<OrderRequestType>,
+    fill_command: &str,
+) {
+    let backend_id = &eng_req.BACKEND_ID;
+    let request_id = &eng_req.request_id;
+
+    let payload = match &eng_req.payload {
+        Payload::Order(p) => p.clone(),
+        _ => return,
+    };
+
+    let order_id = Uuid::new_v4().to_string();
+    let quantity: u64 = match payload.quantity.trim().parse() {
+        Ok(q) => q,
+        Err(_) => {
+            let res = empty_response(request_id, &order_id, Rejected, "Invalid quantity");
+            publish_response(publisher, backend_id, &res);
+            return;
+        }
+    };
+    let price: u64 = payload
+        .price
+        .as_deref()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let (order_type, side) = match (
+        OrderType::from_str(&payload.r#type),
+        Side::from_str(&payload.side),
+    ) {
+        (Ok(t), Ok(s)) => (t, s),
+        _ => {
+            let res = EngineResponse {
+                remaining_quantity: quantity,
+                price,
+                ..empty_response(
+                    request_id,
+                    &order_id,
+                    Rejected,
+                    "Invalid order type or side",
+                )
+            };
+            publish_response(publisher, backend_id, &res);
+            return;
+        }
+    };
+
+    let open_order = OpenOrder {
+        backend_id: backend_id.clone(),
+        request_id: request_id.clone(),
+        order_id: order_id.clone(),
+        user_id: payload.user_id.to_string(),
+        order_type,
+        side,
+        symbol: payload.symbol,
+        quantity,
+        price,
+        created_at: Utc::now().timestamp_millis(),
+    };
+
+    let orderbook = match orderbooks.get_mut(&open_order.symbol) {
+        Some(ob) => ob,
+        None => {
+            let res = EngineResponse {
+                remaining_quantity: quantity,
+                price,
+                ..empty_response(
+                    request_id,
+                    &order_id,
+                    Rejected,
+                    "Market not available on orderbook",
+                )
+            };
+            publish_response(publisher, backend_id, &res);
+            return;
+        }
+    };
+
+    match ORDERBOOK::create_order(orderbook, open_order.clone()) {
+        Ok(order_detail) => {
+            let is_market = open_order.order_type == OrderType::Market;
+
+            // Market orders report the average execution price (integer division),
+            // limit orders their limit price.
+            let response_price = if is_market && order_detail.filled_quantity > 0 {
+                let notional: u128 = order_detail
+                    .fills
+                    .iter()
+                    .map(|f| f.price as u128 * f.filled_quantity as u128)
+                    .sum();
+                (notional / order_detail.filled_quantity as u128) as u64
+            } else {
+                open_order.price
+            };
+
+            let payload_res_data = EngineResponse {
+                request_id: request_id.clone(),
+                order_id: open_order.order_id.clone(),
+                filled_quantity: order_detail.filled_quantity,
+                remaining_quantity: open_order.quantity - order_detail.filled_quantity,
+                status: order_detail.status.clone(),
+                price: response_price,
+                message: "Order created successfully".to_string(),
+                data: None,
+                fills: order_detail.fills.clone(),
+            };
+
+            for current_fill in &order_detail.fills {
+                publish_settlement(
+                    publisher,
+                    &DBWorkerResponse {
+                        request_id: Some(request_id.clone()),
+                        fill: Some(current_fill.clone()),
+                        payload: DBPayload::Engine(payload_res_data.clone()),
+                        request_type,
+                        order_id: order_detail.order_id.clone(),
+                        command: fill_command.to_string(),
+                        order: None,
+                    },
+                );
+                publish_risk(
+                    publisher,
+                    &RiskEngineResponse {
+                        fill: Some(current_fill.clone()),
+                        command: "fill-order".to_string(),
+                        order: None,
+                    },
+                );
+            }
+
+            // A limit order with remaining quantity rests on the book.
+            let rested = !is_market
+                && order_detail.filled_quantity < open_order.quantity
+                && matches!(order_detail.status, Accepted | OrderStatus::PartiallyFilled);
+            if rested {
+                let resting = OpenOrder {
+                    quantity: open_order.quantity - order_detail.filled_quantity,
+                    ..open_order.clone()
+                };
+                publish_risk(
+                    publisher,
+                    &RiskEngineResponse {
+                        fill: None,
+                        order: Some(resting.clone()),
+                        command: "create-order".to_string(),
+                    },
+                );
+                publish_settlement(
+                    publisher,
+                    &DBWorkerResponse {
+                        request_id: Some(request_id.clone()),
+                        fill: None,
+                        payload: DBPayload::Engine(payload_res_data.clone()),
+                        request_type,
+                        order_id: order_detail.order_id.clone(),
+                        command: "create-order".to_string(),
+                        order: Some(resting),
+                    },
+                );
+            }
+
+            publish_response(publisher, backend_id, &payload_res_data);
+        }
+        Err(e) => {
+            let res = EngineResponse {
+                remaining_quantity: open_order.quantity,
+                price: open_order.price,
+                ..empty_response(request_id, &order_id, Rejected, &e.to_string())
+            };
+            publish_response(publisher, backend_id, &res);
+        }
+    }
+}
+
+// cancel-order / get-order payloads: either a bare order id (what the backend and the
+// TypeScript engine use) or {symbol, order_id}.
+fn order_id_and_symbol(payload: &Payload) -> Option<(String, Option<String>)> {
+    match payload {
+        Payload::GetDepth(order_id) => Some((order_id.clone(), None)),
+        Payload::GetOrCancelOrder(p) => Some((p.order_id.clone(), Some(p.symbol.clone()))),
+        Payload::Order(_) => None,
+    }
+}
+
+fn find_symbol(
+    orderbooks: &HashMap<String, ORDERBOOK>,
+    order_id: &str,
+    hint: Option<String>,
+) -> Option<String> {
+    if let Some(symbol) = hint {
+        if orderbooks
+            .get(&symbol)
+            .map_or(false, |ob| ob.orders.contains_key(order_id))
+        {
+            return Some(symbol);
+        }
+    }
+    orderbooks
+        .iter()
+        .find(|(_, ob)| ob.orders.contains_key(order_id))
+        .map(|(symbol, _)| symbol.clone())
+}
+
+fn handle_cancel_order(
+    eng_req: &EngineRequest,
+    orderbooks: &mut HashMap<String, ORDERBOOK>,
+    publisher: &Publisher,
+) {
+    let backend_id = &eng_req.BACKEND_ID;
+    let request_id = &eng_req.request_id;
+    let Some((order_id, hint)) = order_id_and_symbol(&eng_req.payload) else {
+        return;
+    };
+
+    let cancelled = find_symbol(orderbooks, &order_id, hint)
+        .and_then(|symbol| orderbooks.get_mut(&symbol))
+        .and_then(|ob| ORDERBOOK::cancel_order(ob, order_id.clone()).ok());
+
+    match cancelled {
+        Some(order) => {
+            let res = EngineResponse {
+                request_id: request_id.clone(),
+                order_id: order.order_id.clone(),
+                filled_quantity: 0,
+                remaining_quantity: order.quantity,
+                status: Cancelled,
+                price: order.price,
+                message: "Order cancelled".to_string(),
+                data: Some(order.clone()),
+                fills: vec![],
+            };
+
+            publish_settlement(
+                publisher,
+                &DBWorkerResponse {
+                    request_id: Some(request_id.clone()),
+                    fill: None,
+                    payload: DBPayload::CancelOrder(DBPayloadRes {
+                        symbol: order.symbol.clone(),
+                    }),
+                    request_type: None,
+                    order: Some(order.clone()),
+                    order_id: order.order_id.clone(),
+                    command: "cancel-order".to_string(),
+                },
+            );
+            publish_risk(
+                publisher,
+                &RiskEngineResponse {
+                    order: Some(order),
+                    command: "cancel-order".to_string(),
+                    fill: None,
+                },
+            );
+            publish_response(publisher, backend_id, &res);
+        }
+        None => {
+            let res = empty_response(request_id, "", NotFound, "Order not found");
+            publish_response(publisher, backend_id, &res);
+        }
+    }
+}
+
+fn handle_get_order(
+    eng_req: &EngineRequest,
+    orderbooks: &mut HashMap<String, ORDERBOOK>,
+    publisher: &Publisher,
+) {
+    let backend_id = &eng_req.BACKEND_ID;
+    let request_id = &eng_req.request_id;
+    let Some((order_id, hint)) = order_id_and_symbol(&eng_req.payload) else {
+        return;
+    };
+
+    let found = find_symbol(orderbooks, &order_id, hint)
+        .and_then(|symbol| orderbooks.get(&symbol))
+        .and_then(|ob| ORDERBOOK::get_order(ob, order_id.clone()).ok());
+
+    let res = match found {
+        Some(o) => EngineResponse {
+            request_id: request_id.clone(),
+            order_id: o.order_id.clone(),
+            filled_quantity: 0,
+            remaining_quantity: o.quantity,
+            status: Accepted,
+            price: o.price,
+            message: "Order sitting on book".to_string(),
+            data: Some(o),
+            fills: vec![],
+        },
+        None => empty_response(request_id, "", NotFound, "Order not found"),
+    };
+    publish_response(publisher, backend_id, &res);
+}
+
+fn handle_get_depth(
+    eng_req: &EngineRequest,
+    orderbooks: &mut HashMap<String, ORDERBOOK>,
+    publisher: &Publisher,
+) {
+    let Payload::GetDepth(symbol) = &eng_req.payload else {
+        return;
+    };
+
+    // Unknown market: empty depth, like the TypeScript engine. No level cap.
+    let depth = match orderbooks.get(symbol) {
+        Some(ob) => ORDERBOOK::get_depth(ob, u64::MAX),
+        None => matching_engine_rust::order::DepthDetail {
+            asks: vec![],
+            bids: vec![],
+            timestamp: Utc::now().timestamp_millis(),
+        },
+    };
+
+    let res_data = DepthResponse {
+        request_id: eng_req.request_id.clone(),
+        symbol: symbol.clone(),
+        asks: depth.asks,
+        bids: depth.bids,
+        timestamp: depth.timestamp,
+    };
+    let res_json = serde_json::to_string(&res_data).expect("Failed to convert JSON");
+    publisher.response(response_queue(&eng_req.BACKEND_ID), res_json);
+}
+
+// Requests are matched on the command string; unknown or unsupported commands are ignored
+// (the TypeScript engine does the same) instead of panicking the engine.
 fn process_incoming(
     eng_req: EngineRequest,
     orderbooks: &mut HashMap<String, ORDERBOOK>,
-    publish_client: &mut Connection,
-    db_worker_client: &mut Connection,
-    risk_engine_pub_client: &mut Connection,
+    publisher: &Publisher,
 ) {
-    match EngineCommand::from_str(&eng_req.command).unwrap() {
-        CreateOrder => {
-            let backend_id = eng_req.BACKEND_ID.clone();
-            let request_id = eng_req.request_id.clone();
-
-            let payload = match eng_req.payload.clone() {
-                Payload::Order(order_payload) => Ok(order_payload),
-                Payload::GetOrCancelOrder(_) => Err(Error::msg("not valid payload")),
-                Payload::GetDepth(_) => Err(Error::msg("not valid payload")),
-            };
-
-            if payload.is_ok() {
-                let payload = payload.unwrap();
-                let (price, quantity): (u64, u64) = (
-                    payload
-                        .price
-                        .as_deref()
-                        .and_then(|s| s.trim().parse().ok())
-                        .unwrap_or(0),
-                    payload.quantity.parse().unwrap(),
-                );
-
-                let open_order = OpenOrder {
-                    backend_id: backend_id.clone(),
-                    request_id: request_id.clone(),
-                    order_id: Uuid::new_v4().to_string(),
-                    user_id: payload.user_id.to_string(),
-                    order_type: OrderType::from_str(&payload.r#type).unwrap(),
-                    side: Side::from_str(&payload.side).unwrap(),
-                    symbol: payload.symbol,
-                    quantity,
-                    price,
-                    created_at: Utc::now().timestamp_millis(),
-                };
-                let mut orderbook = orderbooks.get_mut(&open_order.symbol).unwrap();
-                let ord = ORDERBOOK::create_order(&mut orderbook, open_order.clone());
-
-                match ord {
-                    Ok(order_detail) => {
-                        let payload_res_data = EngineResponse {
-                            request_id: request_id.clone(),
-                            order_id: open_order.order_id,
-                            filled_quantity: order_detail.filled_quantity,
-                            remaining_quantity: open_order.quantity - order_detail.filled_quantity,
-                            status: order_detail.status,
-                            price: open_order.price,
-                            message: "Order created successfully".to_string(),
-                            data: None,
-                            fills: order_detail.fills.clone(),
-                        };
-                        for current_fill in &order_detail.fills {
-                            let payload_res = DBPayload::Engine(payload_res_data.clone());
-
-                            let db_res_data = DBWorkerResponse {
-                                request_id: Some(request_id.clone()),
-                                fill: Some(current_fill.clone()),
-                                payload: payload_res,
-                                request_type: None,
-                                order_id: order_detail.order_id.clone(),
-                                command: "create-fill".to_string(),
-                                order: None,
-                            };
-
-                            let db_res_json = serde_json::to_string(&db_res_data)
-                                .expect("Failed to convert to json");
-
-                            db_worker_client.lpush::<_, _, ()>("settlement-queue", db_res_json);
-
-                            let risk_res_data = RiskEngineResponse {
-                                fill: Some(current_fill.clone()),
-                                command: "fill-order".to_string(),
-                                order: None,
-                            };
-
-                            let risk_res_json = serde_json::to_string(&risk_res_data)
-                                .expect("Failed to convert json");
-
-                            risk_engine_pub_client
-                                .lpush::<_, _, ()>("matching-to-risk-pub-queue", risk_res_json);
-                        }
-
-                        let res_json: String = serde_json::to_string(&payload_res_data)
-                            .expect("Failed to convert JSON");
-
-                        let res_queue: String = format!("response-queue-{backend_id}");
-
-                        publish_client.lpush::<_, _, ()>(res_queue, res_json);
-                    }
-                    Err(e) => {
-                        let res_data = EngineResponse {
-                            request_id: request_id.clone(),
-                            order_id: open_order.order_id,
-                            filled_quantity: 0,
-                            remaining_quantity: open_order.quantity,
-                            status: Rejected,
-                            price: open_order.price,
-                            message: e.to_string(),
-                            data: None,
-                            fills: vec![],
-                        };
-
-                        let res_json: String =
-                            serde_json::to_string(&res_data).expect("Failed to convert JSON");
-
-                        let res_queue: String = format!("response-queue-{backend_id}");
-
-                        publish_client.lpush::<_, _, ()>(res_queue, res_json);
-                    }
-                }
-            }
-        }
-        EngineCommand::CancelOrder => {
-            let backend_id = eng_req.BACKEND_ID.clone();
-            let request_id = eng_req.request_id.clone();
-
-            let payload = match eng_req.payload.clone() {
-                Payload::Order(order_payload) => Err(Error::msg("not valid payload")),
-                Payload::GetOrCancelOrder(order) => Ok(order),
-                Payload::GetDepth(_) => Err(Error::msg("not valid payload")),
-            };
-
-            if let Ok(orderPayload) = &payload {
-                let order_id = orderPayload.to_owned().order_id;
-                let symbol = orderPayload.to_owned().symbol;
-
-                let mut orderbook = orderbooks.get_mut(&symbol).unwrap();
-                let ord = ORDERBOOK::cancel_order(&mut orderbook, order_id.clone());
-
-                match ord {
-                    Ok(ord) => {
-                        let res_data = EngineResponse {
-                            request_id: request_id.clone(),
-                            order_id: order_id.to_owned(),
-                            filled_quantity: 0,
-                            remaining_quantity: ord.quantity,
-                            status: Cancelled,
-                            price: 0,
-                            message: "Order cancelled".to_string(),
-                            data: None,
-                            fills: vec![],
-                        };
-
-                        let res_json: String =
-                            serde_json::to_string(&res_data).expect("Failed to convert JSON");
-
-                        let res_queue: String = format!("response-queue-{backend_id}");
-
-                        publish_client.lpush::<_, _, ()>(res_queue, res_json);
-
-                        let current_order = ord;
-                        let payload_res = DBPayload::CancelOrder(DBPayloadRes {
-                            symbol: current_order.symbol.clone(),
-                        });
-
-                        let db_res_data = DBWorkerResponse {
-                            request_id: Some(request_id.clone()),
-                            fill: None,
-                            payload: payload_res,
-                            request_type: None,
-                            order: Some(current_order.clone()),
-                            order_id: current_order.clone().order_id,
-                            command: "cancel-order".to_string(),
-                        };
-
-                        let db_res_json =
-                            serde_json::to_string(&db_res_data).expect("Failed to convert to json");
-
-                        db_worker_client.lpush::<_, _, ()>("settlement-queue", db_res_json);
-
-                        let risk_res_data = RiskEngineResponse {
-                            order: Some(current_order),
-                            command: "cancel-order".to_string(),
-                            fill: None,
-                        };
-
-                        let risk_res_json =
-                            serde_json::to_string(&risk_res_data).expect("Failed to convert json");
-
-                        risk_engine_pub_client
-                            .lpush::<_, _, ()>("matching-to-risk-pub-queue", risk_res_json);
-                    }
-                    Err(_) => {
-                        // println!("failed to get order");
-                        let res_data = EngineResponse {
-                            request_id: request_id.clone(),
-                            order_id: order_id.to_string(),
-                            filled_quantity: 0,
-                            remaining_quantity: 0,
-                            status: NotFound,
-                            price: 0,
-                            message: "Order not found".to_string(),
-                            data: None,
-                            fills: vec![],
-                        };
-
-                        let res_json: String =
-                            serde_json::to_string(&res_data).expect("Failed to convert JSON");
-
-                        let res_queue: String = format!("response-queue-{backend_id}");
-
-                        publish_client.lpush::<_, _, ()>(res_queue, res_json);
-                    }
-                }
-            }
-        }
-        EngineCommand::GetOrder => {
-            let backend_id = eng_req.BACKEND_ID.clone();
-            let request_id = eng_req.request_id.clone();
-
-            let payload = match eng_req.payload.clone() {
-                Payload::Order(order_payload) => Err(Error::msg("not valid payload")),
-                Payload::GetOrCancelOrder(order) => Ok(order),
-                Payload::GetDepth(_) => Err(Error::msg("not valid payload")),
-            };
-
-            if payload.is_ok() {
-                let current_pay = payload.unwrap();
-                let order_id = current_pay.order_id;
-                let symbol = current_pay.symbol;
-
-                let orderbook = orderbooks.get_mut(&symbol).unwrap();
-
-                let order = ORDERBOOK::get_order(&orderbook, order_id.to_string());
-
-                match order {
-                    Ok(o) => {
-                        let res_data = EngineResponse {
-                            request_id: request_id.clone(),
-                            order_id: order_id.to_string(),
-                            filled_quantity: 0,
-                            remaining_quantity: o.quantity,
-                            status: Accepted,
-                            price: 0,
-                            message: "Order sitting on book".to_string(),
-                            data: Some(o),
-                            fills: vec![],
-                        };
-
-                        let res_json: String =
-                            serde_json::to_string(&res_data).expect("Failed to convert JSON");
-
-                        let res_queue: String = format!("response-queue-{backend_id}");
-
-                        publish_client.lpush::<_, _, ()>(res_queue, res_json);
-                    }
-                    Err(_) => {
-                        // println!("failed to get order");
-                        let res_data = EngineResponse {
-                            request_id: request_id.clone(),
-                            order_id: order_id.to_string(),
-                            filled_quantity: 0,
-                            remaining_quantity: 0,
-                            status: NotFound,
-                            price: 0,
-                            message: "Order not found".to_string(),
-                            data: None,
-                            fills: vec![],
-                        };
-
-                        let res_json: String =
-                            serde_json::to_string(&res_data).expect("Failed to convert JSON");
-
-                        let res_queue: String = format!("response-queue-{backend_id}");
-
-                        publish_client.lpush::<_, _, ()>(res_queue, res_json);
-                    }
-                }
-            }
-        }
-        EngineCommand::GetDepth => {
-            let backend_id = eng_req.BACKEND_ID.clone();
-            let request_id = eng_req.request_id.clone();
-
-            let payload = match eng_req.payload.clone() {
-                Payload::Order(_) => Err(Error::msg("not valid payload")),
-                Payload::GetOrCancelOrder(_) => Err(Error::msg("not valid payload")),
-                Payload::GetDepth(txt) => Ok(txt),
-            };
-            let symbol = &payload.unwrap();
-
-            let orderbook = orderbooks.get_mut(symbol).unwrap();
-            let limit = 100;
-            let depth = ORDERBOOK::get_depth(&orderbook, limit);
-
-            let res_data = DepthResponse {
-                request_id: request_id.clone(),
-                symbol: "".to_string(),
-                asks: depth.asks,
-                bids: depth.bids,
-                timestamp: depth.timestamp,
-            };
-            let res_json: String =
-                serde_json::to_string(&res_data).expect("Failed to convert JSON");
-
-            let res_queue: String = format!("response-queue-{backend_id}");
-
-            publish_client.lpush::<_, _, ()>(res_queue, res_json);
-        }
-
-        EngineCommand::GetBalance => todo!(),
-        EngineCommand::ForcedLiquidate => todo!(),
-        EngineCommand::ClosePosition => todo!(),
+    let Ok(command) = EngineCommand::from_str(&eng_req.command) else {
+        return;
+    };
+    match command {
+        CreateOrder => handle_create_order(&eng_req, orderbooks, publisher, None, "create-fill"),
+        CancelOrder => handle_cancel_order(&eng_req, orderbooks, publisher),
+        GetOrder => handle_get_order(&eng_req, orderbooks, publisher),
+        GetDepth => handle_get_depth(&eng_req, orderbooks, publisher),
+        GetBalance | ForcedLiquidate | EngineCommand::ClosePosition => {}
     }
 }
 
 fn process_liquidation(
     eng_req: EngineRequest,
     orderbooks: &mut HashMap<String, ORDERBOOK>,
-    publish_client: &mut Connection,
-    db_worker_client: &mut Connection,
-    risk_engine_pub_client: &mut Connection,
+    publisher: &Publisher,
 ) {
-    match EngineCommand::from_str(&eng_req.command).unwrap() {
-        CreateOrder => todo!(),
-        CancelOrder => todo!(),
-        GetOrder => todo!(),
-        GetDepth => todo!(),
-        GetBalance => todo!(),
-        ForcedLiquidate => {
-            let backend_id = eng_req.BACKEND_ID.clone();
-            let request_id = eng_req.request_id.clone();
-
-            let payload = match eng_req.payload.clone() {
-                Payload::Order(order_payload) => Ok(order_payload),
-                Payload::GetOrCancelOrder(_) => Err(Error::msg("not valid payload")),
-                Payload::GetDepth(_) => Err(Error::msg("not valid payload")),
-            };
-
-            if payload.is_ok() {
-                let payload = payload.unwrap();
-
-                let open_order = OpenOrder {
-                    backend_id: backend_id.clone(),
-                    request_id: request_id.clone(),
-                    order_id: Uuid::new_v4().to_string(),
-                    user_id: payload.user_id.to_string(),
-                    order_type: OrderType::from_str(&payload.r#type).unwrap(),
-                    side: Side::from_str(&payload.side).unwrap(),
-                    symbol: payload.symbol,
-                    quantity: payload.quantity.parse().unwrap(),
-                    price: payload
-                        .price
-                        .as_deref()
-                        .and_then(|s| s.trim().parse().ok())
-                        .unwrap_or(0),
-                    created_at: Utc::now().timestamp_millis(),
-                };
-                let mut orderbook = orderbooks.get_mut(&open_order.symbol).unwrap();
-                let ord = ORDERBOOK::create_order(&mut orderbook, open_order.clone());
-
-                match ord {
-                    Ok(order_detail) => {
-                        let payload_res_data = EngineResponse {
-                            request_id: request_id.clone(),
-                            order_id: open_order.order_id,
-                            filled_quantity: order_detail.filled_quantity,
-                            remaining_quantity: open_order.quantity - order_detail.filled_quantity,
-                            status: order_detail.status,
-                            price: open_order.price,
-                            message: "Order created successfully".to_string(),
-                            data: None,
-                            fills: order_detail.fills.clone(),
-                        };
-                        for current_fill in &order_detail.fills {
-                            let payload_res = DBPayload::Engine(payload_res_data.clone());
-
-                            let db_res_data = DBWorkerResponse {
-                                request_id: Some(request_id.clone()),
-                                fill: Some(current_fill.clone()),
-                                payload: payload_res,
-                                request_type: Some(OrderRequestType::Perp),
-                                order_id: order_detail.order_id.clone(),
-                                command: "create-fill".to_string(),
-                                order: None,
-                            };
-
-                            let db_res_json = serde_json::to_string(&db_res_data)
-                                .expect("Failed to convert to json");
-
-                            db_worker_client.lpush::<_, _, ()>("settlement-queue", db_res_json);
-
-                            let risk_res_data = RiskEngineResponse {
-                                fill: Some(current_fill.clone()),
-                                command: "fill-order".to_string(),
-                                order: None,
-                            };
-
-                            let risk_res_json = serde_json::to_string(&risk_res_data)
-                                .expect("Failed to convert json");
-
-                            risk_engine_pub_client
-                                .lpush::<_, _, ()>("matching-to-risk-pub-queue", risk_res_json);
-                        }
-
-                        let res_json: String = serde_json::to_string(&payload_res_data)
-                            .expect("Failed to convert JSON");
-
-                        let res_queue: String = format!("response-queue-{backend_id}");
-
-                        publish_client.lpush::<_, _, ()>(res_queue, res_json);
-                    }
-                    Err(e) => {
-                        let res_data = EngineResponse {
-                            request_id: request_id.clone(),
-                            order_id: open_order.order_id,
-                            filled_quantity: 0,
-                            remaining_quantity: open_order.quantity,
-                            status: Rejected,
-                            price: open_order.price,
-                            message: e.to_string(),
-                            data: None,
-                            fills: vec![],
-                        };
-
-                        let res_json: String =
-                            serde_json::to_string(&res_data).expect("Failed to convert JSON");
-
-                        let res_queue: String = format!("response-queue-{backend_id}");
-
-                        publish_client.lpush::<_, _, ()>(res_queue, res_json);
-                    }
-                }
-            }
-        }
-        EngineCommand::ClosePosition => todo!(),
+    if let Ok(ForcedLiquidate) = EngineCommand::from_str(&eng_req.command) {
+        handle_create_order(&eng_req, orderbooks, publisher, Some(Perp), "create-fill");
     }
 }
 
 fn process_risk(
     eng_req: EngineRequest,
     orderbooks: &mut HashMap<String, ORDERBOOK>,
-    publish_client: &mut Connection,
-    db_worker_client: &mut Connection,
-    risk_engine_pub_client: &mut Connection,
+    publisher: &Publisher,
 ) {
-    match EngineCommand::from_str(&eng_req.command).unwrap() {
-        CreateOrder => {
-            let backend_id = eng_req.BACKEND_ID.clone();
-            let request_id = eng_req.request_id.clone();
-
-            let payload = match eng_req.payload.clone() {
-                Payload::Order(order_payload) => Ok(order_payload),
-                Payload::GetOrCancelOrder(_) => Err(Error::msg("not valid payload")),
-                Payload::GetDepth(_) => Err(Error::msg("not valid payload")),
-            };
-
-            if payload.is_ok() {
-                let payload = payload.unwrap();
-
-                let open_order = OpenOrder {
-                    backend_id: backend_id.clone(),
-                    request_id: request_id.clone(),
-                    order_id: Uuid::new_v4().to_string(),
-                    user_id: payload.user_id.to_string(),
-                    order_type: OrderType::from_str(&payload.r#type).unwrap(),
-                    side: Side::from_str(&payload.side).unwrap(),
-                    symbol: payload.symbol,
-                    quantity: payload.quantity.parse().unwrap(),
-                    price: payload
-                        .price
-                        .as_deref()
-                        .and_then(|s| s.trim().parse().ok())
-                        .unwrap_or(0),
-                    created_at: Utc::now().timestamp_millis(),
-                };
-                let mut orderbook = orderbooks.get_mut(&open_order.symbol).unwrap();
-                let ord = ORDERBOOK::create_order(&mut orderbook, open_order.clone());
-
-                match ord {
-                    Ok(order_detail) => {
-                        let payload_res_data = EngineResponse {
-                            request_id: request_id.clone(),
-                            order_id: open_order.order_id,
-                            filled_quantity: order_detail.filled_quantity,
-                            remaining_quantity: open_order.quantity - order_detail.filled_quantity,
-                            status: order_detail.status,
-                            price: open_order.price,
-                            message: "Order created successfully".to_string(),
-                            data: None,
-                            fills: order_detail.fills.clone(),
-                        };
-                        for current_fill in &order_detail.fills {
-                            let payload_res = DBPayload::Engine(payload_res_data.clone());
-
-                            let db_res_data = DBWorkerResponse {
-                                request_id: Some(request_id.clone()),
-                                fill: Some(current_fill.clone()),
-                                payload: payload_res,
-                                request_type: Some(OrderRequestType::Perp),
-                                order_id: order_detail.order_id.clone(),
-                                command: "create-fill".to_string(),
-                                order: None,
-                            };
-
-                            let db_res_json = serde_json::to_string(&db_res_data)
-                                .expect("Failed to convert to json");
-
-                            db_worker_client.lpush::<_, _, ()>("settlement-queue", db_res_json);
-
-                            let risk_res_data = RiskEngineResponse {
-                                fill: Some(current_fill.clone()),
-                                command: "fill-order".to_string(),
-                                order: None,
-                            };
-
-                            let risk_res_json = serde_json::to_string(&risk_res_data)
-                                .expect("Failed to convert json");
-
-                            risk_engine_pub_client
-                                .lpush::<_, _, ()>("matching-to-risk-pub-queue", risk_res_json);
-                        }
-
-                        let res_json: String = serde_json::to_string(&payload_res_data)
-                            .expect("Failed to convert JSON");
-
-                        let res_queue: String = format!("response-queue-{backend_id}");
-
-                        publish_client.lpush::<_, _, ()>(res_queue, res_json);
-                    }
-                    Err(e) => {
-                        let res_data = EngineResponse {
-                            request_id: request_id.clone(),
-                            order_id: open_order.order_id,
-                            filled_quantity: 0,
-                            remaining_quantity: open_order.quantity,
-                            status: Rejected,
-                            price: open_order.price,
-                            message: e.to_string(),
-                            data: None,
-                            fills: vec![],
-                        };
-
-                        let res_json: String =
-                            serde_json::to_string(&res_data).expect("Failed to convert JSON");
-
-                        let res_queue: String = format!("response-queue-{backend_id}");
-
-                        publish_client.lpush::<_, _, ()>(res_queue, res_json);
-                    }
-                }
-            }
+    match EngineCommand::from_str(&eng_req.command) {
+        Ok(CreateOrder) => {
+            handle_create_order(&eng_req, orderbooks, publisher, Some(Perp), "create-fill")
         }
-        EngineCommand::CancelOrder => todo!(),
-        EngineCommand::GetOrder => todo!(),
-        EngineCommand::GetDepth => todo!(),
-        EngineCommand::GetBalance => todo!(),
-        EngineCommand::ForcedLiquidate => todo!(),
-        EngineCommand::ClosePosition => {
-            let backend_id = eng_req.BACKEND_ID.clone();
-            let request_id = eng_req.request_id.clone();
-
-            let payload = match eng_req.payload.clone() {
-                Payload::Order(order_payload) => Ok(order_payload),
-                Payload::GetOrCancelOrder(_) => Err(Error::msg("not valid payload")),
-                Payload::GetDepth(_) => Err(Error::msg("not valid payload")),
-            };
-
-            if payload.is_ok() {
-                let payload = payload.unwrap();
-
-                let open_order = OpenOrder {
-                    backend_id: backend_id.clone(),
-                    request_id: request_id.clone(),
-                    order_id: Uuid::new_v4().to_string(),
-                    user_id: payload.user_id.to_string(),
-                    order_type: OrderType::from_str(&payload.r#type).unwrap(),
-                    side: Side::from_str(&payload.side).unwrap(),
-                    symbol: payload.symbol,
-                    quantity: payload.quantity.parse().unwrap(),
-                    price: payload
-                        .price
-                        .as_deref()
-                        .and_then(|s| s.trim().parse().ok())
-                        .unwrap_or(0),
-                    created_at: Utc::now().timestamp_millis(),
-                };
-                let mut orderbook = orderbooks.get_mut(&open_order.symbol).unwrap();
-                let ord = ORDERBOOK::create_order(&mut orderbook, open_order.clone());
-
-                match ord {
-                    Ok(order_detail) => {
-                        let payload_res_data = EngineResponse {
-                            request_id: request_id.clone(),
-                            order_id: open_order.order_id,
-                            filled_quantity: order_detail.filled_quantity,
-                            remaining_quantity: open_order.quantity - order_detail.filled_quantity,
-                            status: order_detail.status,
-                            price: open_order.price,
-                            message: "Order created successfully".to_string(),
-                            data: None,
-                            fills: order_detail.fills.clone(),
-                        };
-                        for current_fill in &order_detail.fills {
-                            let payload_res = DBPayload::Engine(payload_res_data.clone());
-
-                            let db_res_data = DBWorkerResponse {
-                                request_id: Some(request_id.clone()),
-                                fill: Some(current_fill.clone()),
-                                payload: payload_res,
-                                request_type: Some(OrderRequestType::Perp),
-                                order_id: order_detail.order_id.clone(),
-                                command: "close-position".to_string(),
-                                order: None,
-                            };
-
-                            let db_res_json = serde_json::to_string(&db_res_data)
-                                .expect("Failed to convert to json");
-
-                            db_worker_client.lpush::<_, _, ()>("settlement-queue", db_res_json);
-
-                            let risk_res_data = RiskEngineResponse {
-                                fill: Some(current_fill.clone()),
-                                command: "fill-order".to_string(),
-                                order: None,
-                            };
-
-                            let risk_res_json = serde_json::to_string(&risk_res_data)
-                                .expect("Failed to convert json");
-
-                            risk_engine_pub_client
-                                .lpush::<_, _, ()>("matching-to-risk-pub-queue", risk_res_json);
-                        }
-
-                        let res_json: String = serde_json::to_string(&payload_res_data)
-                            .expect("Failed to convert JSON");
-
-                        let res_queue: String = format!("response-queue-{backend_id}");
-
-                        publish_client.lpush::<_, _, ()>(res_queue, res_json);
-                    }
-                    Err(e) => {
-                        let res_data = EngineResponse {
-                            request_id: request_id.clone(),
-                            order_id: open_order.order_id,
-                            filled_quantity: 0,
-                            remaining_quantity: open_order.quantity,
-                            status: Rejected,
-                            price: open_order.price,
-                            message: e.to_string(),
-                            data: None,
-                            fills: vec![],
-                        };
-
-                        let res_json: String =
-                            serde_json::to_string(&res_data).expect("Failed to convert JSON");
-
-                        let res_queue: String = format!("response-queue-{backend_id}");
-
-                        publish_client.lpush::<_, _, ()>(res_queue, res_json);
-                    }
-                }
-            }
-        }
+        Ok(EngineCommand::ClosePosition) => handle_create_order(
+            &eng_req,
+            orderbooks,
+            publisher,
+            Some(Perp),
+            "close-position",
+        ),
+        _ => {}
     }
 }

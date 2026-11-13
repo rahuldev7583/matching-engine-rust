@@ -19,7 +19,7 @@ pub enum Side {
 pub enum OrderType {
     #[strum(serialize = "limit")]
     Limit,
-    #[strum(serialize = "Market")]
+    #[strum(serialize = "market", serialize = "Market")]
     Market,
 }
 

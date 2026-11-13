@@ -158,48 +158,30 @@ impl Orderbook for ORDERBOOK {
 
     fn cancel_order(&mut self, order_id: String) -> Result<OpenOrder, Error> {
         let order = self.orders.remove(&order_id);
-        //        println!("open order: {:?}", order);
 
         match order {
             Some(order) => {
                 let price = order.price;
-
-                if order.side == Buy {
-                    let mut bid_orders = self.bids.get_mut(&price).unwrap();
-
-                    let index = bid_orders
-                        .iter()
-                        .position(|ord| ord.order_id == order_id)
-                        .unwrap();
-
-                    //                    println!("matched order index: {}", index);
-
-                    bid_orders.remove(index);
-                    let bid_ords = self.bids.get(&order.price).unwrap();
-
-                    if bid_ords.is_empty() {
-                        self.bids.remove(&order.price);
-                    }
-                    Ok(order)
+                let book = if order.side == Buy {
+                    &mut self.bids
                 } else {
-                    let mut ask_orders = self.asks.get_mut(&price).unwrap();
+                    &mut self.asks
+                };
 
-                    let index = ask_orders
-                        .iter()
-                        .position(|ord| ord.order_id == order_id)
-                        .unwrap();
+                let level = book
+                    .get_mut(&price)
+                    .ok_or_else(|| Error::msg("Order not found"))?;
+                let index = level
+                    .iter()
+                    .position(|ord| ord.order_id == order_id)
+                    .ok_or_else(|| Error::msg("Order not found"))?;
 
-                    //                    println!("matched order index: {}", index);
-
-                    ask_orders.remove(index);
-                    let ask_ords = self.asks.get(&order.price).unwrap();
-
-                    if ask_ords.is_empty() {
-                        self.asks.remove(&order.price);
-                    }
-
-                    Ok(order)
+                // The entry in the level carries the live remaining quantity.
+                let live = level.remove(index).unwrap();
+                if level.is_empty() {
+                    book.remove(&price);
                 }
+                Ok(live)
             }
             None => Err(Error::msg("Order not found")),
         }
@@ -207,10 +189,15 @@ impl Orderbook for ORDERBOOK {
 
     fn get_order(&self, order_id: String) -> Result<OpenOrder, Error> {
         let order = self.orders.get(&order_id);
-        //        println!("open order: {:?}", order);
 
         match order {
-            Some(o) => Ok(o.to_owned()),
+            Some(o) => {
+                let book = if o.side == Buy { &self.bids } else { &self.asks };
+                let live = book
+                    .get(&o.price)
+                    .and_then(|level| level.iter().find(|ord| ord.order_id == order_id));
+                Ok(live.unwrap_or(o).to_owned())
+            }
             None => Err(Error::msg("get order failed")),
         }
     }
@@ -238,7 +225,7 @@ impl Orderbook for ORDERBOOK {
 
         //        println!("agg_asks: {:?}", agg_asks);
 
-        for (p, o) in self.bids.iter().take(limit as usize) {
+        for (p, o) in self.bids.iter().rev().take(limit as usize) {
             let mut price = p.to_owned();
             let mut quantity: u64 = 0;
 
@@ -793,9 +780,23 @@ impl Orderbook for ORDERBOOK {
 
         loop {
             let ord_key_val = if order.side == Buy {
-                self.asks.first_key_value().unwrap().to_owned()
+                self.asks.first_key_value()
             } else {
-                self.bids.last_key_value().unwrap().to_owned()
+                self.bids.last_key_value()
+            };
+            let ord_key_val = match ord_key_val {
+                Some(kv) => kv,
+                None => {
+                    if filled_quantity == 0 {
+                        return Err(Error::msg("No liquidity"));
+                    }
+                    return Ok(OrderDetail {
+                        order_id: order.order_id,
+                        filled_quantity,
+                        status: PartiallyFilled,
+                        fills: new_order.fills.clone(),
+                    });
+                }
             };
 
             let book_order_price = ord_key_val.0.to_owned();
